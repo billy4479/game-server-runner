@@ -1,6 +1,7 @@
 //! HTTP routes: the status API, auth, the websocket feed, and the frontend.
 
 mod auth;
+mod frontend;
 mod ws;
 
 use std::sync::Arc;
@@ -29,6 +30,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/ping", get(ping))
         .nest("/api/auth", auth::auth_routes(state.clone()))
         .route("/api/ws", get(ws::ws_handler).route_layer(auth))
+        .fallback(frontend::fallback)
         .with_state(state)
 }
 

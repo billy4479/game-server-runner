@@ -4,6 +4,8 @@ result-*
 
 target/
 
+frontend/node_modules/
+frontend/dist/
 
 # Added by cargo
 
