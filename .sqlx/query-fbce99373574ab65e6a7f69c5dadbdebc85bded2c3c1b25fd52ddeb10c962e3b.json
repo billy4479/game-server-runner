@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(*) AS \"count: i64\" FROM tokens\n           WHERE user_id = 0 AND kind = 'invitation'\n             AND (expires IS NULL OR expires > ?)",
+  "describe": {
+    "columns": [
+      {
+        "name": "count: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fbce99373574ab65e6a7f69c5dadbdebc85bded2c3c1b25fd52ddeb10c962e3b"
+}

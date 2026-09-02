@@ -4,6 +4,50 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+futures-util = "0.3"
+libc = "0.2"
+rand = "0.9"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha3 = "0.10"
+sqlx = { version = "0.9", features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+    "tls-none",
+] }
+thiserror = "2"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "io-util",
+    "io-std",
+    "net",
+    "signal",
+    "sync",
+    "time",
+] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# Serve the Svelte build embedded from frontend/dist instead of a
+# placeholder page. Requires `pnpm build` in frontend/ before cargo runs.
+embed-frontend = []
+
+[dev-dependencies]
+tempfile = "3"
+tokio-tungstenite = "0.30"
+
 [profile.release]
 debug = true
 
@@ -76,4 +120,3 @@ allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
 
 inline_always = "warn"
-
