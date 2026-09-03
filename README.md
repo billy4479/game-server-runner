@@ -85,6 +85,29 @@ Stop rules:
 - Escalation is uniform: graceful action, wait `grace_period`, then SIGKILL.
   No intermediate SIGINT.
 
+## Java flags
+
+Minecraft pins the Java version: 1.12 to 1.16.5 runs on Java 8, 1.17 on
+16, 1.18 to 1.20.4 on 17, 1.20.5 to 26.0 on 21, and 26.1 and newer on 25.
+Whatever set you pick, give `-Xms` and `-Xmx` the same value and leave
+1-1.5 GB of RAM outside the heap for the JVM itself.
+
+- [Aikar's flags](https://docs.papermc.io/paper/aikars-flags/) with G1GC
+  are still the standard recommendation and work on every Java version
+  above. Use them as published: they need
+  `-XX:+UnlockExperimentalVMOptions` to unlock the G1 tuning knobs. That
+  flag is not needed for ZGC.
+- Generational ZGC is the low-pause alternative, at the cost of more RAM
+  and CPU cores, so it pays off on 6-8 GB heaps and 4+ cores. On Java 21
+  and 22 enable it with `-XX:+UseZGC -XX:+ZGenerational`; plain `-XX:+UseZGC`
+  there gives the old non-generational collector, which is worse than G1
+  here. On Java 23 and newer `-XX:+UseZGC` alone is already generational.
+  Don't mix in the Aikar/G1 flags, they do nothing for ZGC.
+
+ZGC extras worth adding: `-XX:+AlwaysPreTouch`, `-XX:+UseStringDeduplication`
+on Java 18+, `-XX:TrimNativeHeapInterval=5000` on Linux with glibc, and
+`-XX:+UseCompactObjectHeaders` on Java 25+.
+
 ## Player tracking
 
 The join and leave regexes must each contain a `(?P<player>...)` named
