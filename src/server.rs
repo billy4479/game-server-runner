@@ -195,10 +195,6 @@ impl Runner {
             debug!("a stop is already in progress");
             return;
         }
-        telegram::send_message(
-            &self.global.telegram,
-            &format!("Server {} stopping...", self.server.server_name),
-        );
         let sender = {
             let channels = self.lock_channels();
             channels.control.clone()
@@ -353,17 +349,9 @@ impl Runner {
             match &event {
                 PlayerEvent::Joined(name) => {
                     debug!(player = %name, "player joined");
-                    telegram::send_message(
-                        &self.global.telegram,
-                        &format!("Player {name} joined the game"),
-                    );
                 }
                 PlayerEvent::Left(name) => {
                     debug!(player = %name, "player left");
-                    telegram::send_message(
-                        &self.global.telegram,
-                        &format!("Player {name} left the game"),
-                    );
                 }
             }
             self.broadcast_state();
@@ -378,13 +366,6 @@ impl Runner {
     /// stop only fires if no newer schedule or exit invalidated it.
     fn schedule_auto_stop(self: &Arc<Self>) {
         let minutes = self.global.minutes_before_stop;
-        telegram::send_message(
-            &self.global.telegram,
-            &format!(
-                "Server {} scheduled to stop in {minutes} minutes",
-                self.server.server_name
-            ),
-        );
         let delay_secs = minutes.saturating_mul(60);
         let generation = self
             .auto_stop_generation
