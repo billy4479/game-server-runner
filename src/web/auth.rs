@@ -274,9 +274,8 @@ async fn telegram_login(
     queue_registration(&state, &identity).await
 }
 
-/// Queue an unknown account for admin approval and ping the admin chat
-/// once. A second request while already queued is a conflict, not a new
-/// queue entry, and never a second notification.
+/// Queue an unknown account for admin approval. A second request while
+/// already queued is a conflict, not a new queue entry.
 async fn queue_registration(
     state: &AppState,
     identity: &telegram::LoginIdentity,
@@ -365,19 +364,6 @@ async fn queue_registration(
             }
         }
     }
-
-    // Tell the admin chat. Fire and forget: a Telegram outage must not
-    // break the queueing itself, and approval also works from the panel.
-    let who = identity
-        .username
-        .clone()
-        .or_else(|| identity.name.clone())
-        .unwrap_or_else(|| identity.telegram_id.to_string());
-    let id = identity.telegram_id;
-    telegram::send_message(
-        &state.telegram,
-        &format!("registration request from {who} (id {id}) - approve it in the admin panel"),
-    );
 
     Ok(json_response(
         StatusCode::ACCEPTED,

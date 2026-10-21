@@ -163,8 +163,8 @@ the Telegram Login Widget (bot username from `[telegram] username`); the
 widget hands the page a signed payload which the runner verifies against the
 bot token (HMAC-SHA256 keyed with SHA-256 of the token, payload freshness
 bounded to 5 minutes). Known accounts get a session. Unknown accounts are
-queued as registration requests and the admin chat gets a notification; a
-second request while queued is a conflict; unapproved requests are dropped
+queued as registration requests; a second request while queued is a
+conflict; unapproved requests are dropped
 after an hour and can simply be queued again. The admin approves or denies
 from the web UI. Bans are a flag plus an immediate session wipe; unbanned
 accounts log back in without re-approval because the telegram binding
