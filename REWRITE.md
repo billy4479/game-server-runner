@@ -101,6 +101,19 @@ The no-password invite flow stays, with sessions made less sloppy:
   claims onto the existing username instead of creating a new user.
 - 401 responses bounce the frontend back to the login screen.
 
+> **2026-10 redesign (pre-deploy, breaking):** the invite/token machinery
+> was replaced before the runner ever shipped. The admin is now a single
+> tsidp identity (OIDC code+PKCE, username matched against `ADMIN_USERNAME`,
+> ff-style) claiming user 0; friends log in with the Telegram Login Widget
+> and land in an admin-approved registration queue (one-hour expiry, ban
+> flag with immediate session wipe on the account). Invites, register,
+> login and add-device endpoints are gone; sessions and their rotation are
+> exactly as described above. The console UI shows no admin surface either:
+> admin controls moved to a dedicated `/admin` page, which an
+> unauthenticated browser enters straight into the SSO flow and lands back
+> on afterward, while the login page stays Telegram-only for everyone and
+> auto-redirects only browsers marked by a completed admin login.
+
 ## Storage
 
 ```sql

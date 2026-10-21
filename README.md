@@ -19,16 +19,11 @@ Or build and run the binary from `result/bin`. The working directory must
 contain a `config.toml` (see below), and the configured server directory
 needs a `server.toml`.
 
-On first start the runner creates its database, makes user 0 the admin, and
-prints the admin invitation token to stderr:
-
-```text
-admin invitation token: AbCdEf...
-```
-
-Open the web UI, register with that token to become the admin, then use the
-admin invite endpoint to invite friends. Invites are links with a token that
-expires after 3 days.
+There is no bootstrap token. Log in as the admin through the OIDC provider
+(tailnet only, see Auth below): the first identity whose username matches
+`ADMIN_USERNAME` becomes user 0. Friends need no tailnet: they log in with
+Telegram, land in the approval queue, and the admin approves them in the web
+UI's admin panel.
 
 ## Global config
 
@@ -48,9 +43,25 @@ restic_path = "restic"            # restic binary
 restic_repo = ""                  # restic repository
 
 [telegram]
-token = ""                        # bot token; empty disables notifications
+token = ""                        # bot token; empty disables notifications AND telegram login
+username = ""                     # bot username without @; needed for the login widget
 chat_ids = ""                     # semicolon separated chat ids, e.g. "1;2;3"
 ```
+
+### OIDC admin login (environment)
+
+The admin account is a single tsidp identity, selected through the
+environment (rendered from sops in deployment, same shape as ff):
+
+```text
+OIDC_ISSUER=https://idp.internal.polpetta.online
+OIDC_CLIENT_ID=game-server-runner
+OIDC_CLIENT_SECRET=...
+ADMIN_USERNAME=jack
+```
+
+All four must be set together, or admin login stays disabled; any partial
+subset refuses the startup (fail closed).
 
 ## Per-server config
 
@@ -121,14 +132,48 @@ documented limitation, not something fancy-regex will fix.
 
 ## Auth
 
-No passwords. The admin creates invite links that register a user (3 day
-expiry). Each device gets its own session, and every authenticated request
-rotates the session token and slides the 30 day expiry forward, so active
-users are never signed out and losing one device does not sign out the
-others. A logged-in user can mint a one-hour one-shot login token to sign in
-another device. Users stale past the 30 days ask the admin for a new invite,
-which claims onto their existing account. 401 responses bounce the frontend
-to the login screen. The admin is user id 0.
+Two login paths, one session mechanism.
+
+**Admin: OIDC against tsidp, ff-style.** Hand-rolled authorization code +
+PKCE S256, `client_secret_post` at the token endpoint, identity claims read
+from `/userinfo` with the opaque access token (the ID token is never
+parsed). The only accepted identity is the one whose `username` claim equals
+`ADMIN_USERNAME` — authorization is enforced by the app, not the provider.
+The matching identity claims user 0; admin rights are structural (`id ==
+0`), so the username check runs only at login. In-flight logins are tracked
+server-side: a state token rides in a short-lived cookie, its hash in the
+database next to the PKCE verifier and the in-site return path, deleted on
+first use. This path only works from the tailnet, like every tsidp relying
+party.
+
+The admin surface is hidden from everyone else. The login page shows only
+the Telegram widget; the admin console lives at `/admin`. An
+unauthenticated browser there goes straight into the SSO flow and lands
+back on `/admin` once authenticated (bookmark that address for the first
+login). A browser that completed an admin login once keeps a `was_admin`
+cookie: from then on the plain login page auto-redirects it into the
+provider with no login screen at all. Logging out and a failed redirect
+(`?sso=skip`) both clear the flow, so logout logs out. Regular users see
+none of this; the console's only admin affordance for them is that an
+un-invited `/admin` visit ends in the provider's consent screen or a
+refusal, never in admin powers.
+
+**Friends: Telegram login with an approval queue.** The login page embeds
+the Telegram Login Widget (bot username from `[telegram] username`); the
+widget hands the page a signed payload which the runner verifies against the
+bot token (HMAC-SHA256 keyed with SHA-256 of the token, payload freshness
+bounded to 5 minutes). Known accounts get a session. Unknown accounts are
+queued as registration requests and the admin chat gets a notification; a
+second request while queued is a conflict; unapproved requests are dropped
+after an hour and can simply be queued again. The admin approves or denies
+from the web UI. Bans are a flag plus an immediate session wipe; unbanned
+accounts log back in without re-approval because the telegram binding
+persists.
+
+**Sessions**, unchanged in behavior: one row per device, every authenticated
+request rotates the token and slides the 30-day expiry, so active users are
+never signed out. 401 responses bounce the frontend to the login screen.
+There are no passwords, no invite links, and no device tokens anywhere.
 
 ## Crash policy
 
