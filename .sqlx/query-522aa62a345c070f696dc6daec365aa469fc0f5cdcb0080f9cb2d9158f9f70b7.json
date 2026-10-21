@@ -1,27 +1,27 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT user_id, expires FROM tokens WHERE token_hash = ? AND kind = 'login'",
+  "query": "SELECT id, banned AS \"banned: bool\" FROM users WHERE telegram_id = ?",
   "describe": {
     "columns": [
       {
-        "name": "user_id",
+        "name": "id",
         "ordinal": 0,
         "type_info": "Integer",
         "origin": {
           "Table": {
-            "table": "tokens",
-            "name": "user_id"
+            "table": "users",
+            "name": "id"
           }
         }
       },
       {
-        "name": "expires",
+        "name": "banned: bool",
         "ordinal": 1,
         "type_info": "Integer",
         "origin": {
           "Table": {
-            "table": "tokens",
-            "name": "expires"
+            "table": "users",
+            "name": "banned"
           }
         }
       }
@@ -31,8 +31,8 @@
     },
     "nullable": [
       false,
-      true
+      false
     ]
   },
-  "hash": "b50c071e7d2f53d31de9a7bb3eeabbfccdadd50954a024ad4ab5666f2e715aca"
+  "hash": "522aa62a345c070f696dc6daec365aa469fc0f5cdcb0080f9cb2d9158f9f70b7"
 }

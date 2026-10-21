@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id FROM users WHERE name = ?",
+  "query": "SELECT id FROM users WHERE telegram_id = ?",
   "describe": {
     "columns": [
       {
@@ -22,5 +22,5 @@
       false
     ]
   },
-  "hash": "8cf010940c5d3c79d2def8b07c71230c835249568d4a724ad4bd7f53007fba5f"
+  "hash": "ae31f2a6870beca0a1c71bc3722eff820c63c7c9ab86b64af336f362812a1b04"
 }

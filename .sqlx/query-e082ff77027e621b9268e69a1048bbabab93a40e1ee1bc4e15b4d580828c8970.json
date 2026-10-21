@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE pending_users SET name = ?, username = ?, created = ?\n                 WHERE telegram_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "e082ff77027e621b9268e69a1048bbabab93a40e1ee1bc4e15b4d580828c8970"
+}

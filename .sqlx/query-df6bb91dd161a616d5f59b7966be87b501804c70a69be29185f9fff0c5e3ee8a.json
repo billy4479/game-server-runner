@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT telegram_id, name, username, created FROM pending_users\n         WHERE created > ? ORDER BY created",
+  "describe": {
+    "columns": [
+      {
+        "name": "telegram_id",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "pending_users",
+            "name": "telegram_id"
+          }
+        }
+      },
+      {
+        "name": "name",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pending_users",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "name": "username",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pending_users",
+            "name": "username"
+          }
+        }
+      },
+      {
+        "name": "created",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "pending_users",
+            "name": "created"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "df6bb91dd161a616d5f59b7966be87b501804c70a69be29185f9fff0c5e3ee8a"
+}

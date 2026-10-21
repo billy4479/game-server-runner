@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT COUNT(*) AS \"count: i64\" FROM tokens\n           WHERE user_id = 0 AND kind = 'invitation'\n             AND (expires IS NULL OR expires > ?)",
+  "query": "SELECT COUNT(*) AS \"count: i64\" FROM pending_users",
   "describe": {
     "columns": [
       {
@@ -11,11 +11,11 @@
       }
     ],
     "parameters": {
-      "Right": 1
+      "Right": 0
     },
     "nullable": [
       false
     ]
   },
-  "hash": "fbce99373574ab65e6a7f69c5dadbdebc85bded2c3c1b25fd52ddeb10c962e3b"
+  "hash": "609b995870a579285654ff9acff83a03cb05d285a9c658f54e1c07fbdeca2802"
 }

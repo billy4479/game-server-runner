@@ -1,15 +1,18 @@
 //! Integration tests that drive the real `game-server-runner` binary with a
 //! fake game server script, speak the websocket protocol to it, and exercise
-//! the M2 auth flows end to end.
+//! the auth flows end to end: the OIDC admin login against a mock provider,
+//! telegram login with the approval queue, and bans.
 //!
 //! Cookie handling note: the runner sets `Secure` cookies, and reqwest's
 //! cookie jar would refuse to store or resend them over plain http. The
 //! tests therefore use no jar: each helper reads the token out of the
 //! `Set-Cookie` response header and sends it back manually as
-//! `Cookie: auth=<value>` (and on the websocket upgrade request). This is
+//! `Cookie: <name>=<value>` (and on the websocket upgrade request). This is
 //! deterministic and mirrors exactly what the browser frontend does.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -20,8 +23,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::{SinkExt, StreamExt};
+use hmac::Hmac;
+use hmac::Mac;
 use serde_json::{Value, json};
-use sha3::{Digest, Sha3_256};
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use tempfile::TempDir;
@@ -37,11 +42,22 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(15);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
-/// Prefix of the stderr log line carrying the bootstrap invitation token.
-const ADMIN_TOKEN_PREFIX: &str = "admin invitation token: ";
 /// Sessions slide forward by this many seconds on every authenticated
 /// request; the rotation test needs the clock to move at least one second.
 const ROTATION_SLEEP: Duration = Duration::from_millis(1100);
+
+/// The tailnet identity the mock provider authenticates as the admin.
+const ADMIN_USERNAME: &str = "jack";
+/// OAuth client credentials shared by the runner env and the mock provider.
+const OIDC_CLIENT_ID: &str = "test-client";
+const OIDC_CLIENT_SECRET: &str = "test-secret";
+/// The one authorization code the mock provider hands out.
+const OIDC_CODE: &str = "test-code";
+/// The access token bound to that code.
+const OIDC_ACCESS_TOKEN: &str = "mock-access-token";
+/// Bot credentials the telegram login tests sign payloads with.
+const TELEGRAM_BOT_TOKEN: &str = "12345:test-bot-token";
+const TELEGRAM_BOT_USERNAME: &str = "test_bot";
 
 /// Fake game server: handles `join <name>`, `leave <name>`, `stop` and
 /// `crash` console commands, exits 0 on SIGTERM within its read timeout.
@@ -116,6 +132,253 @@ grace_period = "1s"
     )
 }
 
+// --- mock oidc provider -----------------------------------------------------
+
+/// Shared state of the mock provider, so tests can stage each attempt.
+#[derive(Default)]
+struct IdpState {
+    /// The S256 challenge seen in the authorize redirect, verified against
+    /// the presented `code_verifier`.
+    challenge: Mutex<Option<String>>,
+    /// The `redirect_uri` the runner used, echoed by the token endpoint.
+    redirect_uri: Mutex<Option<String>>,
+    /// The authorization code is single-use.
+    code_used: Mutex<bool>,
+    /// The username claim served by /userinfo.
+    username: Mutex<String>,
+    /// When set, the token endpoint refuses the exchange.
+    reject_exchange: Mutex<bool>,
+}
+
+/// Minimal stand-in for tsidp: a blocking TCP server speaking just enough
+/// HTTP for the two endpoints the runner calls, `/token` and `/userinfo`.
+struct MockIdp {
+    port: u16,
+    state: Arc<IdpState>,
+}
+
+impl MockIdp {
+    fn new(admin_username: &str) -> Result<Self, String> {
+        let state = Arc::new(IdpState {
+            username: Mutex::new(admin_username.to_string()),
+            ..IdpState::default()
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|err| format!("bind mock idp: {err}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|err| format!("mock idp address: {err}"))?
+            .port();
+        let served = Arc::clone(&state);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let state = Arc::clone(&served);
+                std::thread::spawn(move || handle_idp_connection(stream, &state));
+            }
+        });
+        Ok(Self { port, state })
+    }
+
+    fn issuer(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+/// Stage the provider for one login attempt.
+fn stage_idp(
+    state: &IdpState,
+    challenge: Option<String>,
+    redirect_uri: Option<String>,
+    username: &str,
+    code_used: bool,
+    reject_exchange: bool,
+) {
+    *state
+        .challenge
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = challenge;
+    *state
+        .redirect_uri
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = redirect_uri;
+    *state
+        .username
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = username.to_string();
+    *state
+        .code_used
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = code_used;
+    *state
+        .reject_exchange
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = reject_exchange;
+}
+
+fn handle_idp_connection(mut stream: std::net::TcpStream, state: &Arc<IdpState>) {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(read) => {
+                if let Some(bytes) = chunk.get(..read) {
+                    buffer.extend_from_slice(bytes);
+                }
+            }
+        }
+        if let Some(position) = find(&buffer, b"\r\n\r\n") {
+            break position;
+        }
+    };
+    let head = buffer
+        .get(..header_end)
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default();
+    let mut lines = head.lines();
+    let request_line = lines.next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let path = parts.next().unwrap_or_default().to_string();
+    let mut content_length = 0usize;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    let body_start = header_end.saturating_add(4);
+    let body_end = body_start.saturating_add(content_length);
+    while buffer.len() < body_end {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                if let Some(bytes) = chunk.get(..read) {
+                    buffer.extend_from_slice(bytes);
+                }
+            }
+        }
+    }
+    let body = buffer.get(body_start..).unwrap_or(&[]).to_vec();
+
+    let (status, payload) = match (method.as_str(), path.split('?').next().unwrap_or_default()) {
+        ("POST", "/token") => idp_token_endpoint(&body, state),
+        ("GET", "/userinfo") => idp_userinfo_endpoint(&head, state),
+        _ => (404, json!({ "error": "not_found" }).to_string()),
+    };
+    let response = format!(
+        "HTTP/1.1 {status} mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    if stream.write_all(response.as_bytes()).is_err() {
+        return;
+    }
+    let Ok(()) = stream.flush() else {
+        return;
+    };
+}
+
+/// The token endpoint: verify the client credentials, the one-shot code,
+/// the redirect uri and the PKCE verifier, then hand out the access token.
+fn idp_token_endpoint(body: &[u8], state: &IdpState) -> (u16, String) {
+    if *state
+        .reject_exchange
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+    {
+        return (400, json!({ "error": "invalid_grant" }).to_string());
+    }
+    let form: BTreeMap<String, String> = String::from_utf8_lossy(body)
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(name, value)| (percent_decode(name), percent_decode(value)))
+        .collect();
+    let value = |key: &str| form.get(key).cloned().unwrap_or_default();
+    if value("grant_type") != "authorization_code"
+        || value("code") != OIDC_CODE
+        || value("client_id") != OIDC_CLIENT_ID
+        || value("client_secret") != OIDC_CLIENT_SECRET
+    {
+        return (400, json!({ "error": "invalid_client" }).to_string());
+    }
+
+    // PKCE S256: the presented verifier must hash to the staged challenge.
+    let verifier = value("code_verifier");
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    if state
+        .challenge
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_deref()
+        != Some(challenge.as_str())
+    {
+        return (400, json!({ "error": "invalid_grant" }).to_string());
+    }
+    if state
+        .redirect_uri
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_deref()
+        != Some(value("redirect_uri").as_str())
+    {
+        return (400, json!({ "error": "invalid_grant" }).to_string());
+    }
+
+    // The code is single-use; burn it only after every check passed.
+    {
+        let mut code_used = state
+            .code_used
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *code_used {
+            return (400, json!({ "error": "invalid_grant" }).to_string());
+        }
+        *code_used = true;
+    }
+    (
+        200,
+        json!({ "access_token": OIDC_ACCESS_TOKEN, "token_type": "Bearer" }).to_string(),
+    )
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// The userinfo endpoint: identity claims ride on the opaque access token,
+/// never on a parsed ID token.
+fn idp_userinfo_endpoint(head: &str, state: &IdpState) -> (u16, String) {
+    let authorized = head.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("authorization")
+            && value.trim() == format!("Bearer {OIDC_ACCESS_TOKEN}")
+    });
+    if !authorized {
+        return (401, json!({ "error": "invalid_token" }).to_string());
+    }
+    let username = state
+        .username
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    (
+        200,
+        json!({
+            "sub": "userid:1",
+            "username": username,
+            "name": "Jack",
+            "email": "jack@mail.polpetta.online",
+        })
+        .to_string(),
+    )
+}
+
 type WsClient = WebSocketStream<MaybeTlsStream<TcpStream>>;
 fn next_port() -> u16 {
     static PORT: AtomicU16 = AtomicU16::new(39_560);
@@ -131,27 +394,38 @@ struct TestRunner {
     /// Argv log of the fake restic binary; only exists after a backup ran.
     restic_log: PathBuf,
     stderr: Arc<Mutex<Vec<u8>>>,
+    idp: MockIdp,
+}
+
+/// Optional configuration knobs for [`TestRunner::spawn_full`].
+#[derive(Default)]
+struct SpawnExtras<'a> {
+    restic_repo: Option<&'a str>,
+    /// Configure telegram login with the shared test bot credentials.
+    telegram: bool,
+    extra_env: Vec<(String, String)>,
 }
 
 impl TestRunner {
     /// Write the config files and spawn the real binary in the temp dir,
-    /// with stderr captured into a shared buffer the tests can grep.
+    /// with stderr captured into a shared buffer the tests can grep. The
+    /// OIDC admin login is always configured against a fresh mock provider.
     fn spawn(
         minutes_before_stop: u64,
         server_toml: &str,
         script_name: &str,
         server_script: &str,
     ) -> Result<Self, String> {
-        Self::spawn_with_config(
+        Self::spawn_full(
             minutes_before_stop,
             server_toml,
             script_name,
             server_script,
-            None,
+            SpawnExtras::default(),
         )
     }
 
-    /// Like [`TestRunner::spawn`], but with `restic_repo` set a fake restic
+    /// Like [`TestRunner::spawn`], but with `restic_repo` set: a fake restic
     /// binary is installed and restic backups are enabled with that repo
     /// marker. Telegram stays disabled, the default.
     fn spawn_with_config(
@@ -161,7 +435,46 @@ impl TestRunner {
         server_script: &str,
         restic_repo: Option<&str>,
     ) -> Result<Self, String> {
+        Self::spawn_full(
+            minutes_before_stop,
+            server_toml,
+            script_name,
+            server_script,
+            SpawnExtras {
+                restic_repo,
+                ..SpawnExtras::default()
+            },
+        )
+    }
+
+    /// Like [`TestRunner::spawn`], with telegram login configured.
+    fn spawn_with_telegram(
+        minutes_before_stop: u64,
+        server_toml: &str,
+        script_name: &str,
+        server_script: &str,
+    ) -> Result<Self, String> {
+        Self::spawn_full(
+            minutes_before_stop,
+            server_toml,
+            script_name,
+            server_script,
+            SpawnExtras {
+                telegram: true,
+                ..SpawnExtras::default()
+            },
+        )
+    }
+
+    fn spawn_full(
+        minutes_before_stop: u64,
+        server_toml: &str,
+        script_name: &str,
+        server_script: &str,
+        extras: SpawnExtras<'_>,
+    ) -> Result<Self, String> {
         let port = next_port();
+        let idp = MockIdp::new(ADMIN_USERNAME)?;
         let dir = TempDir::new().map_err(|err| format!("create temp dir: {err}"))?;
         let mut config = format!(
             "db_path = 'test.db'\n\
@@ -171,7 +484,15 @@ impl TestRunner {
              minutes_before_stop = {minutes_before_stop}\n\
              log_level = 'debug'\n"
         );
-        if let Some(repo) = restic_repo {
+        if extras.telegram
+            && let Err(err) = write!(
+                config,
+                "\n[telegram]\ntoken = '{TELEGRAM_BOT_TOKEN}'\nusername = '{TELEGRAM_BOT_USERNAME}'\nchat_ids = '999999'\n"
+            )
+        {
+            return Err(format!("format telegram config: {err}"));
+        }
+        if let Some(repo) = extras.restic_repo {
             let restic_script = dir.path().join("fake-restic.sh");
             std::fs::write(&restic_script, FAKE_RESTIC_SCRIPT)
                 .map_err(|err| format!("write fake restic script: {err}"))?;
@@ -198,9 +519,20 @@ impl TestRunner {
             .map_err(|err| format!("write fake server script: {err}"))?;
         set_executable(&script_path)?;
 
+        let mut env = vec![
+            (String::from("OIDC_ISSUER"), idp.issuer()),
+            (String::from("OIDC_CLIENT_ID"), String::from(OIDC_CLIENT_ID)),
+            (
+                String::from("OIDC_CLIENT_SECRET"),
+                String::from(OIDC_CLIENT_SECRET),
+            ),
+            (String::from("ADMIN_USERNAME"), String::from(ADMIN_USERNAME)),
+        ];
+        env.extend(extras.extra_env);
         let mut child = Command::new(env!("CARGO_BIN_EXE_game-server-runner"))
             .current_dir(dir.path())
             .env("CONFIG_PATH", dir.path().join("config.toml"))
+            .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())
@@ -224,6 +556,7 @@ impl TestRunner {
             db_path,
             restic_log,
             stderr,
+            idp,
         })
     }
 
@@ -262,29 +595,6 @@ impl TestRunner {
     fn stderr_text(&self) -> String {
         let buffer = self.stderr.lock().unwrap_or_else(PoisonError::into_inner);
         String::from_utf8_lossy(&buffer).into_owned()
-    }
-
-    /// Wait for the startup log line `admin invitation token: <b64>` and
-    /// return the token.
-    fn wait_for_admin_token(&self) -> Result<String, String> {
-        let deadline = Instant::now()
-            .checked_add(STARTUP_TIMEOUT)
-            .unwrap_or_else(Instant::now);
-        loop {
-            let text = self.stderr_text();
-            if let Some((_prefix, rest)) = text.split_once(ADMIN_TOKEN_PREFIX) {
-                let line = rest.lines().next().unwrap_or_default();
-                return Ok(line.trim().to_string());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "no admin invitation token on stderr within {STARTUP_TIMEOUT:?}; \
-                     stderr so far: {}",
-                    self.stderr_text()
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
     }
 }
 
@@ -436,38 +746,50 @@ async fn wait_until_listening(port: u16) -> Result<(), String> {
 
 struct HttpResponse {
     status: u16,
-    set_cookie: Option<String>,
+    /// Every `Set-Cookie` header, in response order.
+    set_cookies: Vec<String>,
+    location: Option<String>,
     body: String,
 }
 
-/// One JSON HTTP request with an optional manual `Cookie: auth=<value>`
-/// header. Cookies are never stored in a jar; see the module comment.
+/// One JSON HTTP request with an optional manual `Cookie: name=value`
+/// header. Redirects are never followed: the OIDC endpoints answer with
+/// 3xx and the tests read the Location header themselves. Cookies are never
+/// stored in a jar; see the module comment.
 async fn http_request(
     port: u16,
     method: reqwest::Method,
     path: &str,
     body: Option<Value>,
-    cookie: Option<&str>,
+    cookie: Option<(&str, &str)>,
 ) -> Result<HttpResponse, String> {
     let client = reqwest::Client::builder()
         .timeout(MESSAGE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| format!("build http client: {err}"))?;
     let mut request = client.request(method, format!("http://127.0.0.1:{port}{path}"));
     if let Some(body) = body {
         request = request.json(&body);
     }
-    if let Some(cookie) = cookie {
-        request = request.header(reqwest::header::COOKIE, format!("auth={cookie}"));
+    if let Some((name, value)) = cookie {
+        request = request.header(reqwest::header::COOKIE, format!("{name}={value}"));
     }
     let response = request
         .send()
         .await
         .map_err(|err| format!("http request to {path}: {err}"))?;
     let status = response.status().as_u16();
-    let set_cookie = response
+    let set_cookies = response
         .headers()
-        .get(reqwest::header::SET_COOKIE)
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_string)
+        .collect();
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let body = response
@@ -476,44 +798,181 @@ async fn http_request(
         .map_err(|err| format!("http body of {path}: {err}"))?;
     Ok(HttpResponse {
         status,
-        set_cookie,
+        set_cookies,
+        location,
         body,
     })
 }
 
-/// Extract the session token from an `auth=...; attributes` Set-Cookie
-/// header value.
-fn cookie_from_set_cookie(set_cookie: Option<String>) -> Option<String> {
-    let raw = set_cookie?;
-    let value = raw.strip_prefix("auth=")?;
+/// Extract the token from the first `name=value; attributes` Set-Cookie
+/// header carrying `name`.
+fn cookie_from_set_cookie(set_cookies: &[String], name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    let raw = set_cookies
+        .iter()
+        .find(|cookie| cookie.starts_with(&prefix))?;
+    let value = raw.strip_prefix(&prefix)?;
     let end = value.find(';').unwrap_or(value.len());
     value.get(..end).map(str::to_string)
 }
 
-/// Register a fresh user; returns the new session cookie.
-async fn register(port: u16, invitation_token: &str, name: &str) -> Result<String, String> {
-    let response = http_request(
-        port,
-        reqwest::Method::POST,
-        "/api/auth/register",
-        Some(json!({ "invitation_token": invitation_token, "name": name })),
-        None,
-    )
-    .await?;
-    if response.status != 201 {
-        return Err(format!(
-            "register {name:?} failed: {} {}",
-            response.status, response.body
-        ));
+/// Drive the OIDC login against the mock provider. Returns the raw callback
+/// response: a success carries the session cookie, failures their status.
+/// `return_to` rides through as the post-login destination, like the SPA
+/// sends it.
+async fn oidc_login_attempt(
+    harness: &TestRunner,
+    username: &str,
+    return_to: Option<&str>,
+) -> Result<HttpResponse, String> {
+    let attempt_url = return_to.map_or_else(
+        || String::from("/api/auth/oidc/login"),
+        |path| format!("/api/auth/oidc/login?return_to={path}"),
+    );
+    let start = http_request(harness.port, reqwest::Method::GET, &attempt_url, None, None).await?;
+    if start.status != 303 {
+        return Ok(start);
     }
-    cookie_from_set_cookie(response.set_cookie)
-        .ok_or_else(|| String::from("register response carried no session cookie"))
+    let location = start
+        .location
+        .clone()
+        .ok_or_else(|| String::from("the oidc login redirect carries no location"))?;
+    let query = location
+        .split_once('?')
+        .map_or(String::new(), |(_, query)| query.to_string());
+    let query = query.as_str();
+    let mut params: BTreeMap<String, String> = BTreeMap::new();
+    for pair in query.split('&') {
+        if let Some((name, value)) = pair.split_once('=') {
+            params.insert(percent_decode(name), percent_decode(value));
+        }
+    }
+    let state_token = params
+        .get("state")
+        .cloned()
+        .ok_or_else(|| String::from("authorize url has no state"))?;
+    let challenge = params
+        .get("code_challenge")
+        .cloned()
+        .ok_or_else(|| String::from("authorize url has no code_challenge"))?;
+    let redirect_uri = params
+        .get("redirect_uri")
+        .cloned()
+        .ok_or_else(|| String::from("authorize url has no redirect_uri"))?;
+
+    // Stage the provider: accept this challenge and redirect, serve this
+    // identity, hand out a fresh code.
+    stage_idp(
+        &harness.idp.state,
+        Some(challenge),
+        Some(redirect_uri),
+        username,
+        false,
+        false,
+    );
+
+    let state_cookie = cookie_from_set_cookie(&start.set_cookies, "oidc_login")
+        .ok_or_else(|| String::from("the login redirect carries no state cookie"))?;
+    http_request(
+        harness.port,
+        reqwest::Method::GET,
+        &format!("/api/auth/oidc/callback?code={OIDC_CODE}&state={state_token}"),
+        None,
+        Some(("oidc_login", state_cookie.as_str())),
+    )
+    .await
 }
 
-/// Admin bootstrap: token from stderr, then register user 0 as "admin".
+/// The mock provider of a harness.
+/// Bootstrap an admin session by driving the whole OIDC flow.
 async fn admin_session(harness: &TestRunner) -> Result<String, String> {
-    let token = harness.wait_for_admin_token()?;
-    register(harness.port, &token, "admin").await
+    let attempt = oidc_login_attempt(harness, ADMIN_USERNAME, None).await?;
+    if attempt.status != 303 {
+        return Err(format!(
+            "oidc callback failed: {} {}",
+            attempt.status, attempt.body
+        ));
+    }
+    cookie_from_set_cookie(&attempt.set_cookies, "auth")
+        .ok_or_else(|| String::from("the oidc callback carries no session cookie"))
+}
+
+/// Sign `fields` exactly the way the telegram backend does, returning the
+/// payload with its `hash` field. Non-scalar fields are ignored; the
+/// fixtures only ever use strings and numbers.
+fn signed_telegram_payload(mut fields: serde_json::Map<String, Value>) -> Value {
+    let mut pairs: BTreeMap<String, String> = BTreeMap::new();
+    for (key, value) in &fields {
+        match value {
+            Value::String(text) => {
+                pairs.insert(key.clone(), text.clone());
+            }
+            Value::Number(number) => {
+                pairs.insert(key.clone(), number.to_string());
+            }
+            _ => {}
+        }
+    }
+    let check = pairs
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let secret = Sha256::digest(TELEGRAM_BOT_TOKEN.as_bytes());
+    // The hmac crate accepts any key length, so this cannot fail; a fixture
+    // may not panic, hence the silent fallback.
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&secret) else {
+        return Value::Null;
+    };
+    mac.update(check.as_bytes());
+    fields.insert(
+        String::from("hash"),
+        Value::String(hex_encode(&mac.finalize().into_bytes())),
+    );
+    Value::Object(fields)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let high = HEX.get(usize::from(byte >> 4)).copied().unwrap_or(b'?');
+        let low = HEX.get(usize::from(byte & 15)).copied().unwrap_or(b'?');
+        out.push(char::from(high));
+        out.push(char::from(low));
+    }
+    out
+}
+
+/// A valid, fresh login payload for the given telegram id.
+fn telegram_payload(id: i64, username: &str) -> Value {
+    let mut fields = serde_json::Map::new();
+    fields.insert(String::from("id"), Value::from(id));
+    fields.insert(String::from("first_name"), Value::from(username));
+    fields.insert(String::from("username"), Value::from(username));
+    fields.insert(String::from("auth_date"), Value::from(now_secs()));
+    signed_telegram_payload(fields)
+}
+
+/// Wall clock seconds, saturated; a plain-fn twin of the runner's clock
+/// helper, because helpers outside `#[test]` functions may not panic.
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(i64::MAX, |delta| {
+            i64::try_from(delta.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+async fn telegram_login(port: u16, payload: Value) -> Result<HttpResponse, String> {
+    http_request(
+        port,
+        reqwest::Method::POST,
+        "/api/auth/telegram",
+        Some(payload),
+        None,
+    )
+    .await
 }
 
 /// Authenticated GET /api/auth/me. Rotates `cookie` in place when the
@@ -524,82 +983,14 @@ async fn me(port: u16, cookie: &mut String) -> Result<(u16, Value), String> {
         reqwest::Method::GET,
         "/api/auth/me",
         None,
-        Some(cookie.as_str()),
+        Some(("auth", cookie.as_str())),
     )
     .await?;
-    if let Some(updated) = cookie_from_set_cookie(response.set_cookie) {
+    if let Some(updated) = cookie_from_set_cookie(&response.set_cookies, "auth") {
         *cookie = updated;
     }
     let body: Value = serde_json::from_str(&response.body).unwrap_or(Value::Null);
     Ok((response.status, body))
-}
-
-/// Authenticated POST /api/auth/invite; returns the invitation token.
-async fn invite(port: u16, admin_cookie: &mut String) -> Result<String, String> {
-    let response = http_request(
-        port,
-        reqwest::Method::POST,
-        "/api/auth/invite",
-        None,
-        Some(admin_cookie.as_str()),
-    )
-    .await?;
-    if let Some(updated) = cookie_from_set_cookie(response.set_cookie) {
-        *admin_cookie = updated;
-    }
-    if response.status != 201 {
-        return Err(format!(
-            "invite failed: {} {}",
-            response.status, response.body
-        ));
-    }
-    let body: Value = serde_json::from_str(&response.body)
-        .map_err(|err| format!("invite body is not json: {err}"))?;
-    body.get("invitation_token")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| format!("invite body has no invitation_token: {}", response.body))
-}
-
-/// Authenticated POST /api/auth/addDevice; returns the login token.
-async fn add_device(port: u16, cookie: &mut String) -> Result<String, String> {
-    let response = http_request(
-        port,
-        reqwest::Method::POST,
-        "/api/auth/addDevice",
-        None,
-        Some(cookie.as_str()),
-    )
-    .await?;
-    if let Some(updated) = cookie_from_set_cookie(response.set_cookie) {
-        *cookie = updated;
-    }
-    if response.status != 201 {
-        return Err(format!(
-            "addDevice failed: {} {}",
-            response.status, response.body
-        ));
-    }
-    let body: Value = serde_json::from_str(&response.body)
-        .map_err(|err| format!("addDevice body is not json: {err}"))?;
-    body.get("login_token")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| format!("addDevice body has no login_token: {}", response.body))
-}
-
-/// Unauthenticated POST /api/auth/login from a clean client; returns the
-/// status and the Set-Cookie header value, if any.
-async fn login(port: u16, login_token: &str) -> Result<(u16, Option<String>), String> {
-    let response = http_request(
-        port,
-        reqwest::Method::POST,
-        "/api/auth/login",
-        Some(json!({ "login_token": login_token })),
-        None,
-    )
-    .await?;
-    Ok((response.status, response.set_cookie))
 }
 
 /// Authenticated DELETE /api/auth/logout; rotates `cookie` in place and
@@ -610,10 +1001,69 @@ async fn logout(port: u16, cookie: &mut String) -> Result<u16, String> {
         reqwest::Method::DELETE,
         "/api/auth/logout",
         None,
-        Some(cookie.as_str()),
+        Some(("auth", cookie.as_str())),
     )
     .await?;
-    if let Some(updated) = cookie_from_set_cookie(response.set_cookie) {
+    if let Some(updated) = cookie_from_set_cookie(&response.set_cookies, "auth") {
+        *cookie = updated;
+    }
+    Ok(response.status)
+}
+
+/// Authenticated GET /api/admin/pending.
+async fn admin_list_pending(port: u16, cookie: &mut String) -> Result<(u16, Value), String> {
+    let response = http_request(
+        port,
+        reqwest::Method::GET,
+        "/api/admin/pending",
+        None,
+        Some(("auth", cookie.as_str())),
+    )
+    .await?;
+    if let Some(updated) = cookie_from_set_cookie(&response.set_cookies, "auth") {
+        *cookie = updated;
+    }
+    let body: Value = serde_json::from_str(&response.body).unwrap_or(Value::Null);
+    Ok((response.status, body))
+}
+
+/// Authenticated POST /api/admin/pending/{id}/approve|deny.
+async fn admin_pending_action(
+    port: u16,
+    cookie: &mut String,
+    telegram_id: i64,
+    action: &str,
+) -> Result<u16, String> {
+    let response = http_request(
+        port,
+        reqwest::Method::POST,
+        &format!("/api/admin/pending/{telegram_id}/{action}"),
+        None,
+        Some(("auth", cookie.as_str())),
+    )
+    .await?;
+    if let Some(updated) = cookie_from_set_cookie(&response.set_cookies, "auth") {
+        *cookie = updated;
+    }
+    Ok(response.status)
+}
+
+/// Authenticated POST /api/admin/users/{id}/ban|unban.
+async fn admin_ban_action(
+    port: u16,
+    cookie: &mut String,
+    user_id: i64,
+    action: &str,
+) -> Result<u16, String> {
+    let response = http_request(
+        port,
+        reqwest::Method::POST,
+        &format!("/api/admin/users/{user_id}/{action}"),
+        None,
+        Some(("auth", cookie.as_str())),
+    )
+    .await?;
+    if let Some(updated) = cookie_from_set_cookie(&response.set_cookies, "auth") {
         *cookie = updated;
     }
     Ok(response.status)
@@ -633,6 +1083,36 @@ fn unix_now() -> Result<i64, String> {
         .map_err(|err| format!("clock before the epoch: {err}"))?
         .as_secs();
     i64::try_from(secs).map_err(|err| format!("unix time does not fit i64: {err}"))
+}
+
+fn percent_decode(value: &str) -> String {
+    let with_spaces = value.replace('+', " ");
+    let mut out: Vec<u8> = Vec::with_capacity(with_spaces.len());
+    let mut bytes = with_spaces.as_bytes().iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte != b'%' {
+            out.push(byte);
+            continue;
+        }
+        let high = bytes
+            .next()
+            .and_then(|digit| char::from(digit).to_digit(16));
+        let low = bytes
+            .next()
+            .and_then(|digit| char::from(digit).to_digit(16));
+        let decoded = match (high, low) {
+            (Some(high), Some(low)) => high
+                .checked_mul(16)
+                .and_then(|value| value.checked_add(low))
+                .and_then(|value| u8::try_from(value).ok()),
+            _ => None,
+        };
+        match decoded {
+            Some(byte) => out.push(byte),
+            None => out.push(b'%'),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // --- websocket helpers ------------------------------------------------------
@@ -1096,207 +1576,6 @@ async fn crash_does_not_run_restic_backup() {
 }
 
 #[tokio::test]
-async fn register_rejects_missing_malformed_and_expired_invitation_tokens() {
-    let harness = TestRunner::spawn(
-        5,
-        &lifecycle_server_toml(),
-        "fake-server.sh",
-        FAKE_SERVER_SCRIPT,
-    )
-    .expect("spawn harness");
-    wait_until_listening(harness.port)
-        .await
-        .expect("runner did not come up");
-    harness
-        .wait_for_admin_token()
-        .expect("admin token on stderr");
-
-    // Well-formed but unknown token: 404.
-    let unknown = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
-    let response = http_request(
-        harness.port,
-        reqwest::Method::POST,
-        "/api/auth/register",
-        Some(json!({ "invitation_token": unknown, "name": "whoever" })),
-        None,
-    )
-    .await
-    .expect("register with unknown token");
-    assert_eq!(response.status, 404, "unknown token: {}", response.body);
-
-    // Malformed base64: 400.
-    let response = http_request(
-        harness.port,
-        reqwest::Method::POST,
-        "/api/auth/register",
-        Some(json!({ "invitation_token": "!!! not base64", "name": "whoever" })),
-        None,
-    )
-    .await
-    .expect("register with malformed token");
-    assert_eq!(response.status, 400, "malformed token: {}", response.body);
-
-    // Expired token, planted straight into the database: 401.
-    let db = open_db(&harness.db_path).await.expect("open db");
-    let raw = rand::random::<[u8; 32]>();
-    let expired_token = URL_SAFE_NO_PAD.encode(raw);
-    let hash: [u8; 32] = Sha3_256::digest(raw).into();
-    let now = unix_now().expect("unix time");
-    sqlx::query(
-        "INSERT INTO tokens (token_hash, kind, user_id, expires) VALUES (?, 'invitation', 0, ?)",
-    )
-    .bind(&hash[..])
-    .bind(now - 10)
-    .execute(&db)
-    .await
-    .expect("insert expired invitation token");
-    let response = http_request(
-        harness.port,
-        reqwest::Method::POST,
-        "/api/auth/register",
-        Some(json!({ "invitation_token": expired_token, "name": "whoever" })),
-        None,
-    )
-    .await
-    .expect("register with expired token");
-    assert_eq!(response.status, 401, "expired token: {}", response.body);
-}
-
-#[tokio::test]
-async fn admin_invite_register_login_logout_flow() {
-    let harness = TestRunner::spawn(
-        5,
-        &lifecycle_server_toml(),
-        "fake-server.sh",
-        FAKE_SERVER_SCRIPT,
-    )
-    .expect("spawn harness");
-    wait_until_listening(harness.port)
-        .await
-        .expect("runner did not come up");
-
-    // Bootstrap token from stderr -> register the admin (user 0).
-    let admin_token = harness.wait_for_admin_token().expect("admin token");
-    let mut admin_cookie = register(harness.port, &admin_token, "admin")
-        .await
-        .expect("register admin");
-    let (status, body) = me(harness.port, &mut admin_cookie)
-        .await
-        .expect("me as admin");
-    assert_eq!(status, 200, "me as admin");
-    assert_eq!(body, json!({ "id": 0, "name": "admin" }), "admin identity");
-
-    // Invite a second user and register them as "bob".
-    let invitation = invite(harness.port, &mut admin_cookie)
-        .await
-        .expect("invite by admin");
-    let mut bob_cookie = register(harness.port, &invitation, "bob")
-        .await
-        .expect("register bob");
-    let (status, body) = me(harness.port, &mut bob_cookie).await.expect("me as bob");
-    assert_eq!(status, 200, "me as bob");
-    let bob_id = body["id"].as_i64().expect("bob id is a number");
-    assert_ne!(bob_id, 0, "bob must not be the admin");
-    assert_eq!(body["name"], json!("bob"), "bob name");
-
-    // Non-admins cannot invite. The 403 still rotates the session, so the
-    // test must pick up the new cookie from the response.
-    let response = http_request(
-        harness.port,
-        reqwest::Method::POST,
-        "/api/auth/invite",
-        None,
-        Some(bob_cookie.as_str()),
-    )
-    .await
-    .expect("invite as bob");
-    assert_eq!(response.status, 403, "bob inviting should be forbidden");
-    if let Some(updated) = cookie_from_set_cookie(response.set_cookie) {
-        bob_cookie = updated;
-    }
-
-    // Mint a login token and use it from a clean client.
-    let login_token = add_device(harness.port, &mut bob_cookie)
-        .await
-        .expect("addDevice as bob");
-    let (status, set_cookie) = login(harness.port, &login_token)
-        .await
-        .expect("login with the device token");
-    assert_eq!(status, 201, "login status");
-    let mut device_cookie =
-        cookie_from_set_cookie(set_cookie).expect("login response carries a session cookie");
-    let (status, body) = me(harness.port, &mut device_cookie)
-        .await
-        .expect("me on the new device");
-    assert_eq!(status, 200, "me after login");
-    assert_eq!(body["id"], json!(bob_id), "same user on the new device");
-
-    // Logout ends the session.
-    let status = logout(harness.port, &mut device_cookie)
-        .await
-        .expect("logout");
-    assert_eq!(status, 200, "logout status");
-    let (status, _) = me(harness.port, &mut device_cookie)
-        .await
-        .expect("me after logout");
-    assert_eq!(status, 401, "the logged-out session must be rejected");
-}
-
-#[tokio::test]
-async fn registering_existing_name_claims_the_user() {
-    let harness = TestRunner::spawn(
-        5,
-        &lifecycle_server_toml(),
-        "fake-server.sh",
-        FAKE_SERVER_SCRIPT,
-    )
-    .expect("spawn harness");
-    wait_until_listening(harness.port)
-        .await
-        .expect("runner did not come up");
-    let mut admin_cookie = admin_session(&harness).await.expect("admin session");
-
-    let first_invitation = invite(harness.port, &mut admin_cookie)
-        .await
-        .expect("first invite");
-    let mut bob_cookie = register(harness.port, &first_invitation, "bob")
-        .await
-        .expect("register bob");
-    let (_, body) = me(harness.port, &mut bob_cookie).await.expect("me as bob");
-    let bob_id = body["id"].as_i64().expect("bob id is a number");
-
-    // A fresh invitation registering the same name must claim bob's user.
-    let second_invitation = invite(harness.port, &mut admin_cookie)
-        .await
-        .expect("second invite");
-    let mut reborn_cookie = register(harness.port, &second_invitation, "bob")
-        .await
-        .expect("register bob again");
-    let (status, body) = me(harness.port, &mut reborn_cookie)
-        .await
-        .expect("me as reclaimed bob");
-    assert_eq!(status, 200, "reclaimed me");
-    assert_eq!(
-        body["id"],
-        json!(bob_id),
-        "the invitation must claim the existing bob, not create a new user"
-    );
-
-    // No orphaned placeholder users may remain.
-    let db = open_db(&harness.db_path).await.expect("open db");
-    let null_named: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE name IS NULL")
-        .fetch_one(&db)
-        .await
-        .expect("count null-named users");
-    assert_eq!(null_named, 0, "no NULL-named orphan rows may remain");
-    let bobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE name = 'bob'")
-        .fetch_one(&db)
-        .await
-        .expect("count bob users");
-    assert_eq!(bobs, 1, "bob exists exactly once");
-}
-
-#[tokio::test]
 async fn session_rotates_and_slides_expiry() {
     let harness = TestRunner::spawn(
         5,
@@ -1325,12 +1604,12 @@ async fn session_rotates_and_slides_expiry() {
         reqwest::Method::GET,
         "/api/auth/me",
         None,
-        Some(cookie.as_str()),
+        Some(("auth", cookie.as_str())),
     )
     .await
     .expect("me with the original cookie");
     assert_eq!(response.status, 200, "me with the original cookie");
-    let rotated = cookie_from_set_cookie(response.set_cookie)
+    let rotated = cookie_from_set_cookie(&response.set_cookies, "auth")
         .expect("the response must rotate the session cookie");
     assert_ne!(rotated, cookie, "rotation must produce a new token");
 
@@ -1340,7 +1619,7 @@ async fn session_rotates_and_slides_expiry() {
         reqwest::Method::GET,
         "/api/auth/me",
         None,
-        Some(cookie.as_str()),
+        Some(("auth", cookie.as_str())),
     )
     .await
     .expect("replay of the old cookie");
@@ -1408,4 +1687,675 @@ async fn websocket_requires_an_authenticated_cookie() {
     graceful_shutdown(&mut harness)
         .await
         .expect("graceful shutdown");
+}
+
+// --- oidc admin login -------------------------------------------------------
+
+/// Whatever an unauthenticated admin's SPA does on `/admin`: navigate to
+/// `/api/auth/oidc/login?return_to=/admin`, come back through the provider,
+/// and land on `/admin` with the session and the auto-redirect marker set.
+#[tokio::test]
+async fn oidc_admin_logs_in_from_the_admin_page_and_lands_back_on_it() {
+    let harness = TestRunner::spawn(
+        5,
+        &lifecycle_server_toml(),
+        "fake-server.sh",
+        FAKE_SERVER_SCRIPT,
+    )
+    .expect("spawn harness");
+    wait_until_listening(harness.port)
+        .await
+        .expect("runner did not come up");
+
+    let attempt = oidc_login_attempt(&harness, ADMIN_USERNAME, Some("/admin"))
+        .await
+        .expect("admin login attempt from /admin");
+    assert_eq!(attempt.status, 303, "login succeeded");
+    assert_eq!(
+        attempt.location.as_deref(),
+        Some("/admin"),
+        "the post-login destination is the page that started the login"
+    );
+    assert!(
+        attempt
+            .set_cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("was_admin=1")),
+        "a completed admin login must mark the browser"
+    );
+
+    // A tracked return path can never be a redirect off the site: the
+    // attempt is detached and wires the destination straight to the runner.
+    let hijacked = oidc_login_attempt(&harness, ADMIN_USERNAME, Some("//evil.example"))
+        .await
+        .expect("admin login attempt with a hostile return path");
+    assert_eq!(
+        hijacked.location.as_deref(),
+        Some("/"),
+        "off-site return paths fall back to the console"
+    );
+}
+
+#[tokio::test]
+async fn oidc_admin_login_mints_a_session_and_logout_ends_it() {
+    let harness = TestRunner::spawn(
+        5,
+        &lifecycle_server_toml(),
+        "fake-server.sh",
+        FAKE_SERVER_SCRIPT,
+    )
+    .expect("spawn harness");
+    wait_until_listening(harness.port)
+        .await
+        .expect("runner did not come up");
+
+    // A completed login marks the browser: the login page auto-redirects
+    // it into the next login, so the admin never sees one.
+    let attempt = oidc_login_attempt(&harness, ADMIN_USERNAME, None)
+        .await
+        .expect("admin login attempt");
+    assert_eq!(attempt.status, 303, "login succeeded");
+    assert!(
+        attempt
+            .set_cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("was_admin=1")),
+        "a completed admin login must mark the browser"
+    );
+    let mut cookie = cookie_from_set_cookie(&attempt.set_cookies, "auth")
+        .expect("the oidc callback carries no session cookie");
+
+    let (status, body) = me(harness.port, &mut cookie).await.expect("me as admin");
+    assert_eq!(status, 200, "me as admin");
+    assert_eq!(
+        body,
+        json!({ "id": 0, "name": ADMIN_USERNAME, "is_admin": true }),
+        "the admin is user 0, named after the identity claim"
+    );
+    let auth_config = http_request(
+        harness.port,
+        reqwest::Method::GET,
+        "/api/auth/config",
+        None,
+        Some(("was_admin", "1")),
+    )
+    .await
+    .expect("auth config with marker");
+    assert_eq!(
+        auth_config.body, r#"{"bot_username":null,"oidc":true,"was_admin":true}"#,
+        "the marked browser gets told it may auto-redirect"
+    );
+
+    // Logout ends the session and unmarks the browser: logging out must
+    // actually log out, even against a provider that would auto-approve.
+    let status = logout(harness.port, &mut cookie).await.expect("logout");
+    assert_eq!(status, 200, "logout status");
+    let (status, _) = me(harness.port, &mut cookie)
+        .await
+        .expect("me after logout");
+    assert_eq!(status, 401, "the logged-out session must be rejected");
+}
+
+#[tokio::test]
+async fn oidc_rejects_identities_that_are_not_the_admin() {
+    let harness = TestRunner::spawn(
+        5,
+        &lifecycle_server_toml(),
+        "fake-server.sh",
+        FAKE_SERVER_SCRIPT,
+    )
+    .expect("spawn harness");
+    wait_until_listening(harness.port)
+        .await
+        .expect("runner did not come up");
+
+    // The provider authenticates the tailnet member fine, but the runner
+    // only accepts the configured admin.
+    let attempt = oidc_login_attempt(&harness, "mallory", None)
+        .await
+        .expect("login attempt as mallory");
+    assert_eq!(attempt.status, 403, "non-admin identity must be refused");
+    assert!(
+        !attempt
+            .set_cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("auth=")),
+        "a refused login must not mint a session"
+    );
+
+    // And no session exists afterwards.
+    let response = http_request(
+        harness.port,
+        reqwest::Method::GET,
+        "/api/auth/me",
+        None,
+        None,
+    )
+    .await
+    .expect("me without a session");
+    assert_eq!(response.status, 401, "no session was minted");
+}
+
+#[tokio::test]
+async fn oidc_login_state_is_one_shot() {
+    let harness = TestRunner::spawn(
+        5,
+        &lifecycle_server_toml(),
+        "fake-server.sh",
+        FAKE_SERVER_SCRIPT,
+    )
+    .expect("spawn harness");
+    wait_until_listening(harness.port)
+        .await
+        .expect("runner did not come up");
+
+    // Complete one login, capturing the pieces a replay would need.
+    let start = http_request(
+        harness.port,
+        reqwest::Method::GET,
+        "/api/auth/oidc/login",
+        None,
+        None,
+    )
+    .await
+    .expect("start an oidc login");
+    assert_eq!(start.status, 303, "login start should redirect");
+    let location = start.location.expect("login redirect location");
+    let query = location
+        .split_once('?')
+        .map_or(String::new(), |(_, query)| query.to_string());
+    let query = query.as_str();
+    let state_token = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("state="))
+        .expect("state in the authorize url")
+        .to_string();
+    let state_cookie =
+        cookie_from_set_cookie(&start.set_cookies, "oidc_login").expect("state cookie");
+
+    // Stage the provider and complete the flow once.
+    {
+        let params = params_of(&location);
+        stage_idp(
+            &harness.idp.state,
+            params.get("code_challenge").cloned(),
+            params.get("redirect_uri").cloned(),
+            ADMIN_USERNAME,
+            false,
+            false,
+        );
+    }
+    let first = http_request(
+        harness.port,
+        reqwest::Method::GET,
+        &format!("/api/auth/oidc/callback?code={OIDC_CODE}&state={state_token}"),
+        None,
+        Some(("oidc_login", state_cookie.as_str())),
+    )
+    .await
+    .expect("first callback");
+    assert_eq!(first.status, 303, "the first callback must succeed");
+
+    // The replay: same cookie, same code, same state. The one-shot row is
+    // gone, so the runner must refuse.
+    let replay = http_request(
+        harness.port,
+        reqwest::Method::GET,
+        &format!("/api/auth/oidc/callback?code={OIDC_CODE}&state={state_token}"),
+        None,
+        Some(("oidc_login", state_cookie.as_str())),
+    )
+    .await
+    .expect("replayed callback");
+    assert_eq!(replay.status, 400, "a replayed login must be refused");
+}
+
+#[tokio::test]
+async fn oidc_exchange_failures_surface_as_bad_gateway() {
+    let harness = TestRunner::spawn(
+        5,
+        &lifecycle_server_toml(),
+        "fake-server.sh",
+        FAKE_SERVER_SCRIPT,
+    )
+    .expect("spawn harness");
+    wait_until_listening(harness.port)
+        .await
+        .expect("runner did not come up");
+
+    let start = http_request(
+        harness.port,
+        reqwest::Method::GET,
+        "/api/auth/oidc/login",
+        None,
+        None,
+    )
+    .await
+    .expect("start an oidc login");
+    let location = start.location.expect("login redirect location");
+    let params = params_of(&location);
+    let state_token = params.get("state").cloned().expect("state");
+    let state_cookie =
+        cookie_from_set_cookie(&start.set_cookies, "oidc_login").expect("state cookie");
+
+    {
+        let params = params_of(&location);
+        stage_idp(
+            &harness.idp.state,
+            params.get("code_challenge").cloned(),
+            params.get("redirect_uri").cloned(),
+            ADMIN_USERNAME,
+            false,
+            true,
+        );
+    }
+
+    let attempt = http_request(
+        harness.port,
+        reqwest::Method::GET,
+        &format!("/api/auth/oidc/callback?code={OIDC_CODE}&state={state_token}"),
+        None,
+        Some(("oidc_login", state_cookie.as_str())),
+    )
+    .await
+    .expect("callback with a failing provider");
+    assert_eq!(
+        attempt.status, 502,
+        "a provider-side exchange failure must surface as bad gateway"
+    );
+}
+
+#[tokio::test]
+async fn half_configured_oidc_env_refuses_to_start() {
+    let idp = MockIdp::new(ADMIN_USERNAME).expect("mock idp");
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "port = 0\nserver_name = \"x\"\ncommand = \"true\"\n",
+    )
+    .expect("write config");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_game-server-runner"))
+        .current_dir(dir.path())
+        .env("CONFIG_PATH", dir.path().join("config.toml"))
+        .env("OIDC_ISSUER", idp.issuer())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn runner with a half configured oidc env");
+    let status = wait_for_exit(&mut child, Duration::from_secs(10))
+        .await
+        .expect("wait for exit")
+        .expect("runner should exit on a half configured oidc env");
+    assert!(
+        !status.success(),
+        "a half configured oidc env must refuse to start"
+    );
+    let mut stderr = String::new();
+    if let Some(pipe) = child.stderr.take() {
+        let mut pipe = pipe;
+        pipe.read_to_string(&mut stderr).await.expect("read stderr");
+    }
+    assert!(
+        stderr.contains("half configured"),
+        "the error should say the oidc env is half configured: {stderr}"
+    );
+}
+
+/// Parse the query parameters of a url into a map.
+fn params_of(url: &str) -> BTreeMap<String, String> {
+    let query = url.split_once('?').map_or("", |(_, query)| query);
+    let mut params = BTreeMap::new();
+    for pair in query.split('&') {
+        if let Some((name, value)) = pair.split_once('=') {
+            params.insert(percent_decode(name), percent_decode(value));
+        }
+    }
+    params
+}
+
+// --- telegram login ---------------------------------------------------------
+
+#[tokio::test]
+async fn telegram_unknown_account_queues_and_approval_registers_it() {
+    let harness = TestRunner::spawn_with_telegram(
+        5,
+        &lifecycle_server_toml(),
+        "fake-server.sh",
+        FAKE_SERVER_SCRIPT,
+    )
+    .expect("spawn harness");
+    wait_until_listening(harness.port)
+        .await
+        .expect("runner did not come up");
+
+    // The login page config advertises both login methods.
+    let response = http_request(
+        harness.port,
+        reqwest::Method::GET,
+        "/api/auth/config",
+        None,
+        None,
+    )
+    .await
+    .expect("auth config");
+    assert_eq!(response.status, 200, "auth config status");
+    let config: Value = serde_json::from_str(&response.body).expect("config body");
+    assert_eq!(config["bot_username"], json!(TELEGRAM_BOT_USERNAME));
+    assert_eq!(config["oidc"], json!(true));
+    assert_eq!(config["was_admin"], json!(false), "fresh browser unmarked");
+
+    // Unknown account: queued, not logged in.
+    let response = telegram_login(harness.port, telegram_payload(42, "alice"))
+        .await
+        .expect("telegram login as unknown alice");
+    assert_eq!(response.status, 202, "unknown accounts get queued");
+    let body: Value = serde_json::from_str(&response.body).expect("queueing body");
+    assert_eq!(body["status"], json!("pending"), "queueing status");
+
+    // A second request while queued is a conflict.
+    let response = telegram_login(harness.port, telegram_payload(42, "alice"))
+        .await
+        .expect("second telegram login while queued");
+    assert_eq!(response.status, 409, "duplicate requests conflict");
+    assert!(
+        response.set_cookies.is_empty(),
+        "queueing must not mint a session"
+    );
+
+    // The admin sees the request and approves it.
+    let mut admin_cookie = admin_session(&harness).await.expect("admin session");
+    let (status, pending) = admin_list_pending(harness.port, &mut admin_cookie)
+        .await
+        .expect("pending list");
+    assert_eq!(status, 200, "pending list status");
+    let entry = pending
+        .as_array()
+        .and_then(|entries| entries.first())
+        .cloned()
+        .expect("alice should be queued");
+    assert_eq!(entry["telegram_id"], json!(42), "queued telegram id");
+    assert_eq!(entry["username"], json!("alice"), "queued username");
+
+    let status = admin_pending_action(harness.port, &mut admin_cookie, 42, "approve")
+        .await
+        .expect("approve alice");
+    assert_eq!(status, 201, "approve status");
+
+    // Now the telegram login mints a real session.
+    let response = telegram_login(harness.port, telegram_payload(42, "alice"))
+        .await
+        .expect("telegram login as approved alice");
+    assert_eq!(response.status, 201, "approved accounts get a session");
+    let mut alice_cookie = cookie_from_set_cookie(&response.set_cookies, "auth")
+        .expect("session cookie from telegram login");
+    let (status, body) = me(harness.port, &mut alice_cookie)
+        .await
+        .expect("me as alice");
+    assert_eq!(status, 200, "me as alice");
+    assert_ne!(body["id"], json!(0), "alice is not the admin");
+    assert_eq!(body["is_admin"], json!(false), "alice gets no admin gate");
+    assert_eq!(body["name"], json!("alice"), "alice name from the claim");
+}
+
+#[tokio::test]
+async fn telegram_denied_requests_can_queue_again() {
+    let harness = TestRunner::spawn_with_telegram(
+        5,
+        &lifecycle_server_toml(),
+        "fake-server.sh",
+        FAKE_SERVER_SCRIPT,
+    )
+    .expect("spawn harness");
+    wait_until_listening(harness.port)
+        .await
+        .expect("runner did not come up");
+    let mut admin_cookie = admin_session(&harness).await.expect("admin session");
+
+    let response = telegram_login(harness.port, telegram_payload(7, "bob"))
+        .await
+        .expect("telegram login as unknown bob");
+    assert_eq!(response.status, 202, "bob gets queued");
+
+    let status = admin_pending_action(harness.port, &mut admin_cookie, 7, "deny")
+        .await
+        .expect("deny bob");
+    assert_eq!(status, 200, "deny status");
+    let (status, pending) = admin_list_pending(harness.port, &mut admin_cookie)
+        .await
+        .expect("pending list after deny");
+    assert_eq!(status, 200, "pending list status");
+    assert_eq!(
+        pending.as_array().map(Vec::len),
+        Some(0),
+        "the denied request is gone"
+    );
+
+    // Denial is not a ban: bob may ask again, landing as a fresh request.
+    let response = telegram_login(harness.port, telegram_payload(7, "bob"))
+        .await
+        .expect("telegram login after denial");
+    assert_eq!(response.status, 202, "bob can queue again after a denial");
+}
+
+#[tokio::test]
+async fn telegram_rejects_forged_and_stale_payloads() {
+    let harness = TestRunner::spawn_with_telegram(
+        5,
+        &lifecycle_server_toml(),
+        "fake-server.sh",
+        FAKE_SERVER_SCRIPT,
+    )
+    .expect("spawn harness");
+    wait_until_listening(harness.port)
+        .await
+        .expect("runner did not come up");
+
+    // A tampered payload breaks the signature.
+    let mut forged = telegram_payload(13, "mallory");
+    forged["username"] = json!("admin");
+    let response = telegram_login(harness.port, forged)
+        .await
+        .expect("forged telegram login");
+    assert_eq!(response.status, 401, "tampered payloads must be refused");
+
+    // A payload older than the freshness window is stale.
+    let mut fields = serde_json::Map::new();
+    fields.insert(String::from("id"), Value::from(13));
+    fields.insert(String::from("username"), Value::from("mallory"));
+    fields.insert(
+        String::from("auth_date"),
+        Value::from(unix_now().expect("unix time") - 3600),
+    );
+    let stale = signed_telegram_payload(fields);
+    let response = telegram_login(harness.port, stale)
+        .await
+        .expect("stale telegram login");
+    assert_eq!(response.status, 400, "stale payloads must be refused");
+
+    // A payload without a hash is not a widget payload at all.
+    let unsigned = json!({ "id": 13, "username": "mallory", "auth_date": 1 });
+    let response = telegram_login(harness.port, unsigned)
+        .await
+        .expect("unsigned telegram login");
+    assert_eq!(response.status, 401, "unsigned payloads must be refused");
+
+    // Nothing was queued for the forger.
+    let mut admin_cookie = admin_session(&harness).await.expect("admin session");
+    let (status, pending) = admin_list_pending(harness.port, &mut admin_cookie)
+        .await
+        .expect("pending list");
+    assert_eq!(status, 200, "pending list status");
+    assert_eq!(
+        pending.as_array().map(Vec::len),
+        Some(0),
+        "rejected payloads must not queue"
+    );
+}
+
+#[tokio::test]
+async fn telegram_login_is_disabled_without_a_bot_token() {
+    let harness = TestRunner::spawn(
+        5,
+        &lifecycle_server_toml(),
+        "fake-server.sh",
+        FAKE_SERVER_SCRIPT,
+    )
+    .expect("spawn harness");
+    wait_until_listening(harness.port)
+        .await
+        .expect("runner did not come up");
+
+    let response = http_request(
+        harness.port,
+        reqwest::Method::GET,
+        "/api/auth/config",
+        None,
+        None,
+    )
+    .await
+    .expect("auth config");
+    let config: Value = serde_json::from_str(&response.body).expect("config body");
+    assert_eq!(config["bot_username"], json!(null), "no bot, no widget");
+    assert_eq!(
+        config["oidc"],
+        json!(true),
+        "oidc is always configured here"
+    );
+    assert_eq!(
+        config["was_admin"],
+        json!(false),
+        "no marker, no auto-redirect"
+    );
+
+    let response = telegram_login(harness.port, telegram_payload(1, "whoever"))
+        .await
+        .expect("telegram login while disabled");
+    assert_eq!(response.status, 404, "telegram login must be disabled");
+}
+
+#[tokio::test]
+async fn banning_kicks_sessions_and_locks_the_account() {
+    let harness = TestRunner::spawn_with_telegram(
+        5,
+        &lifecycle_server_toml(),
+        "fake-server.sh",
+        FAKE_SERVER_SCRIPT,
+    )
+    .expect("spawn harness");
+    wait_until_listening(harness.port)
+        .await
+        .expect("runner did not come up");
+    let mut admin_cookie = admin_session(&harness).await.expect("admin session");
+
+    // Register alice through the queue, then log her in.
+    let response = telegram_login(harness.port, telegram_payload(42, "alice"))
+        .await
+        .expect("queue alice");
+    assert_eq!(response.status, 202, "alice queued");
+    let status = admin_pending_action(harness.port, &mut admin_cookie, 42, "approve")
+        .await
+        .expect("approve alice");
+    assert_eq!(status, 201, "alice approved");
+    let response = telegram_login(harness.port, telegram_payload(42, "alice"))
+        .await
+        .expect("alice logs in");
+    assert_eq!(response.status, 201, "alice session");
+    let mut alice_cookie =
+        cookie_from_set_cookie(&response.set_cookies, "auth").expect("alice session cookie");
+    let (status, _) = me(harness.port, &mut alice_cookie)
+        .await
+        .expect("me as alice");
+    assert_eq!(status, 200, "alice is in");
+
+    // Banning wipes her session right away.
+    let status = admin_ban_action(harness.port, &mut admin_cookie, 0, "ban")
+        .await
+        .expect("try to ban the admin");
+    assert_eq!(status, 400, "the admin cannot be banned");
+    let alice_id = alice_user_id(&harness).await.expect("alice id");
+    let status = admin_ban_action(harness.port, &mut admin_cookie, alice_id, "ban")
+        .await
+        .expect("ban alice");
+    assert_eq!(status, 200, "ban status");
+    let (status, _) = me(harness.port, &mut alice_cookie)
+        .await
+        .expect("me as banned alice");
+    assert_eq!(status, 401, "the ban must kill the live session");
+
+    // And she cannot log back in: the account is recognized but refused.
+    let response = telegram_login(harness.port, telegram_payload(42, "alice"))
+        .await
+        .expect("telegram login as banned alice");
+    assert_eq!(response.status, 403, "banned accounts are refused");
+
+    // Unban: the telegram binding is intact, so she is right back in.
+    let status = admin_ban_action(harness.port, &mut admin_cookie, alice_id, "unban")
+        .await
+        .expect("unban alice");
+    assert_eq!(status, 200, "unban status");
+    let response = telegram_login(harness.port, telegram_payload(42, "alice"))
+        .await
+        .expect("telegram login after unban");
+    assert_eq!(response.status, 201, "unbanned accounts can log in again");
+}
+
+/// The user id of the freshly registered alice, read from the database.
+async fn alice_user_id(harness: &TestRunner) -> Result<i64, String> {
+    let db = open_db(&harness.db_path).await?;
+    sqlx::query_scalar("SELECT id FROM users WHERE telegram_id = 42")
+        .fetch_one(&db)
+        .await
+        .map_err(|err| format!("alice should exist: {err}"))
+}
+
+#[tokio::test]
+async fn expired_pending_requests_become_invisible() {
+    let harness = TestRunner::spawn_with_telegram(
+        5,
+        &lifecycle_server_toml(),
+        "fake-server.sh",
+        FAKE_SERVER_SCRIPT,
+    )
+    .expect("spawn harness");
+    wait_until_listening(harness.port)
+        .await
+        .expect("runner did not come up");
+    let mut admin_cookie = admin_session(&harness).await.expect("admin session");
+
+    let response = telegram_login(harness.port, telegram_payload(5, "carol"))
+        .await
+        .expect("queue carol");
+    assert_eq!(response.status, 202, "carol queued");
+
+    // Age the request past the one hour window directly in the database.
+    let db = open_db(&harness.db_path).await.expect("open db");
+    sqlx::query("UPDATE pending_users SET created = created - 7200")
+        .execute(&db)
+        .await
+        .expect("age the pending request");
+
+    let (status, pending) = admin_list_pending(harness.port, &mut admin_cookie)
+        .await
+        .expect("pending list");
+    assert_eq!(status, 200, "pending list status");
+    assert_eq!(
+        pending.as_array().map(Vec::len),
+        Some(0),
+        "expired requests must not be listed"
+    );
+    let status = admin_pending_action(harness.port, &mut admin_cookie, 5, "approve")
+        .await
+        .expect("approve an expired request");
+    assert_eq!(status, 404, "expired requests cannot be approved");
+
+    // The cleanup sweep removes the row entirely; carol can simply queue
+    // again in the meantime.
+    let response = telegram_login(harness.port, telegram_payload(5, "carol"))
+        .await
+        .expect("carol queues again");
+    assert_eq!(
+        response.status, 202,
+        "a fresh request replaces the stale one"
+    );
 }

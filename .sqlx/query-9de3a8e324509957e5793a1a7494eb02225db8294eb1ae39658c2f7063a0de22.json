@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM pending_users WHERE created <= ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "9de3a8e324509957e5793a1a7494eb02225db8294eb1ae39658c2f7063a0de22"
+}

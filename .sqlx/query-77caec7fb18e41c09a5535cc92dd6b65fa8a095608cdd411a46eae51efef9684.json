@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT verifier, return_to, expires FROM oidc_logins WHERE state_hash = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "verifier",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oidc_logins",
+            "name": "verifier"
+          }
+        }
+      },
+      {
+        "name": "return_to",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oidc_logins",
+            "name": "return_to"
+          }
+        }
+      },
+      {
+        "name": "expires",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "oidc_logins",
+            "name": "expires"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "77caec7fb18e41c09a5535cc92dd6b65fa8a095608cdd411a46eae51efef9684"
+}

@@ -91,12 +91,16 @@ pub struct Config {
     pub telegram: TelegramConfig,
 }
 
-/// Telegram settings, parsed now and used in M4.
+/// Telegram settings: the notification bot doubles as the login provider.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TelegramConfig {
     /// Bot token.
     #[serde(default)]
     pub token: String,
+    /// Bot username without the leading `@`; the login widget needs the
+    /// public name to embed itself.
+    #[serde(default)]
+    pub username: String,
     /// Semicolon-separated list of chat ids.
     #[serde(default)]
     pub chat_ids: String,
@@ -123,6 +127,101 @@ impl TelegramConfig {
     #[must_use]
     pub fn chat_id_count(&self) -> usize {
         self.chat_ids().count()
+    }
+
+    /// Whether telegram login can work: it needs the token to verify widget
+    /// payloads with and the public bot username for the widget embed.
+    #[must_use]
+    pub fn login_configured(&self) -> bool {
+        self.token_configured() && !self.username.trim().is_empty()
+    }
+}
+
+/// Admin login against the tailnet OIDC provider, configured entirely
+/// through the environment (sops-rendered in deployment). The four settings
+/// are accepted only as a complete set: anything in between fails the
+/// startup, so a half-rendered secret template can never silently disable
+/// the admin login or widen it.
+#[derive(Debug, Clone)]
+pub struct OidcConfig {
+    /// Issuer base URL, without a trailing slash.
+    pub issuer: String,
+    /// OAuth client id.
+    pub client_id: String,
+    /// OAuth client secret.
+    pub client_secret: String,
+    /// The only identity accepted as the admin: the `username` claim must
+    /// equal this value.
+    pub admin_username: String,
+}
+
+impl OidcConfig {
+    /// Read the configuration from the environment.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] when some but not all of the four
+    /// variables are set.
+    pub fn from_env() -> Result<Option<Self>, ConfigError> {
+        let read = |key: &str| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        };
+        Self::from_values(
+            read("OIDC_ISSUER"),
+            read("OIDC_CLIENT_ID"),
+            read("OIDC_CLIENT_SECRET"),
+            read("ADMIN_USERNAME"),
+        )
+    }
+
+    /// Validate the four settings as a unit: none set means the admin login
+    /// is disabled, all set means it is enabled, anything else is an error.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] when some but not all values are
+    /// present.
+    pub fn from_values(
+        issuer: Option<String>,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+        admin_username: Option<String>,
+    ) -> Result<Option<Self>, ConfigError> {
+        match (issuer, client_id, client_secret, admin_username) {
+            (None, None, None, None) => Ok(None),
+            (Some(issuer), Some(client_id), Some(client_secret), Some(admin_username)) => {
+                let issuer = issuer.trim_end_matches('/').to_string();
+                Ok(Some(Self {
+                    issuer,
+                    client_id,
+                    client_secret,
+                    admin_username,
+                }))
+            }
+            _ => Err(ConfigError::Invalid(String::from(
+                "OIDC admin login is half configured: set OIDC_ISSUER, OIDC_CLIENT_ID, \
+                 OIDC_CLIENT_SECRET and ADMIN_USERNAME together, or none of them",
+            ))),
+        }
+    }
+
+    /// The provider's authorization endpoint, per the tsidp endpoint layout.
+    #[must_use]
+    pub fn authorize_url(&self) -> String {
+        format!("{}/authorize", self.issuer)
+    }
+
+    /// The provider's token endpoint.
+    #[must_use]
+    pub fn token_url(&self) -> String {
+        format!("{}/token", self.issuer)
+    }
+
+    /// The provider's userinfo endpoint; identity claims are read from here
+    /// with the opaque access token, never from the ID token.
+    #[must_use]
+    pub fn userinfo_url(&self) -> String {
+        format!("{}/userinfo", self.issuer)
     }
 }
 
@@ -484,6 +583,7 @@ mod tests {
         assert_eq!(config.restic_path, "restic", "restic path default");
         assert_eq!(config.restic_repo, "", "restic repo default");
         assert_eq!(config.telegram.token, "", "telegram token default");
+        assert_eq!(config.telegram.username, "", "telegram username default");
         assert_eq!(config.telegram.chat_ids, "", "telegram chat ids default");
     }
 
@@ -502,6 +602,7 @@ restic_repo = '/backups/repo'
 
 [telegram]
 token = 'tok'
+username = 'mybot'
 chat_ids = '1;2;3'
 ";
         let config = global_config_from_str(source, Path::new("config.toml"))
@@ -516,6 +617,7 @@ chat_ids = '1;2;3'
         assert_eq!(config.restic_path, "/usr/bin/restic");
         assert_eq!(config.restic_repo, "/backups/repo");
         assert_eq!(config.telegram.token, "tok");
+        assert_eq!(config.telegram.username, "mybot");
         assert_eq!(config.telegram.chat_ids, "1;2;3");
     }
 
@@ -760,6 +862,62 @@ chat_ids = '1;2;3'
             err.to_string().contains("signal"),
             "error should mention the allowed modes: {err}"
         );
+    }
+
+    #[test]
+    fn oidc_config_is_all_or_nothing() {
+        let issuer = Some(String::from("https://idp.example.com"));
+        let client_id = Some(String::from("client"));
+        let client_secret = Some(String::from("secret"));
+        let admin = Some(String::from("jack"));
+
+        // No settings at all: the admin login is disabled, not an error.
+        assert!(
+            OidcConfig::from_values(None, None, None, None).is_ok_and(|config| config.is_none()),
+            "no settings should disable the admin login"
+        );
+
+        // The complete set parses, and the issuer loses its trailing slash.
+        let config = OidcConfig::from_values(
+            issuer.clone(),
+            client_id.clone(),
+            client_secret.clone(),
+            admin.clone(),
+        )
+        .unwrap_or_else(|err| panic!("complete oidc config should be valid: {err}"));
+        let config = config.expect("checked is_some above");
+        assert_eq!(config.issuer, "https://idp.example.com");
+        assert_eq!(config.client_id, "client");
+        assert_eq!(config.client_secret, "secret");
+        assert_eq!(config.admin_username, "jack");
+        assert_eq!(config.authorize_url(), "https://idp.example.com/authorize");
+        assert_eq!(config.token_url(), "https://idp.example.com/token");
+        assert_eq!(config.userinfo_url(), "https://idp.example.com/userinfo");
+
+        // Every three-of-four subset must be rejected: fail closed.
+        let subsets = [
+            (
+                None,
+                client_id.clone(),
+                client_secret.clone(),
+                admin.clone(),
+            ),
+            (issuer.clone(), None, client_secret.clone(), admin.clone()),
+            (issuer.clone(), client_id.clone(), None, admin),
+            (issuer, client_id, client_secret, None),
+        ];
+        for (index, (issuer, client_id, client_secret, admin)) in subsets.iter().enumerate() {
+            let result = OidcConfig::from_values(
+                issuer.clone(),
+                client_id.clone(),
+                client_secret.clone(),
+                admin.clone(),
+            );
+            assert!(
+                result.is_err(),
+                "dropping setting {index} should be an error, not a silent disable"
+            );
+        }
     }
 
     #[test]

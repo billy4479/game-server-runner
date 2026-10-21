@@ -77,13 +77,16 @@ async fn run() -> Result<(), AppError> {
     let global = Arc::new(config::load_global_config(&PathBuf::from(config_path))?);
 
     init_tracing(&global.log_level);
+    let oidc = config::OidcConfig::from_env()?;
     debug!(
         db_path = %global.db_path,
         restic_enable = global.restic_enable,
         restic_repo = %global.restic_repo,
         restic_path = %global.restic_path,
         telegram_configured = global.telegram.token_configured(),
+        telegram_login = global.telegram.login_configured(),
         telegram_chats = global.telegram.chat_id_count(),
+        oidc_login = oidc.is_some(),
         "configuration loaded"
     );
     info!(version = env!("CARGO_PKG_VERSION"), "game-server-runner");
@@ -93,7 +96,6 @@ async fn run() -> Result<(), AppError> {
     Runner::spawn_console_forwarder(&runner);
 
     let db = db::init(&global.db_path).await?;
-    db::ensure_admin_token(&db).await?;
     db::spawn_cleanup_task(db.clone());
 
     let port = global.port;
@@ -103,6 +105,8 @@ async fn run() -> Result<(), AppError> {
     let app = web::router(web::AppState {
         runner: Arc::clone(&runner),
         db,
+        telegram: global.telegram.clone(),
+        oidc,
     });
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(runner))
@@ -114,8 +118,7 @@ fn init_tracing(level: &str) {
     let filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(config::log_level_filter(level).into())
         .parse_lossy("");
-    // stderr, so stdout stays reserved for data and the admin invitation
-    // token is greppable from the journal/stderr like in mc-runner.
+    // stderr, so stdout stays reserved for data.
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

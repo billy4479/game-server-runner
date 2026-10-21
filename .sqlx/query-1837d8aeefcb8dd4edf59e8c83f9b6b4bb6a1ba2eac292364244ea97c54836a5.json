@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM oidc_logins WHERE expires <= ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "1837d8aeefcb8dd4edf59e8c83f9b6b4bb6a1ba2eac292364244ea97c54836a5"
+}

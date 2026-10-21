@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO oidc_logins (state_hash, verifier, return_to, expires)\n         VALUES (?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "6b8d24c7522fd2a15a28cabd65ee7b3fab306e4f94a8c15da6649ce64f14429d"
+}

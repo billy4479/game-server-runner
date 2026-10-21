@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM oidc_logins WHERE state_hash = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "4d2199f2b1cb193ef965679d5a2c34d7f90a4e38ee06993c83ce7dd320cc68bd"
+}

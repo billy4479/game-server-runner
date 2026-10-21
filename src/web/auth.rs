@@ -1,6 +1,7 @@
-//! Auth endpoints and middleware: invite-based registration, login tokens,
-//! and sessions that rotate and slide their expiry on every authenticated
-//! request. Error bodies are small JSON; the frontend only reads the status.
+//! Auth endpoints and middleware: telegram login with an admin approval
+//! queue, the OIDC admin login (see [`super::oidc`]), and sessions that
+//! rotate and slide their expiry on every authenticated request. Error
+//! bodies are small JSON; the frontend only reads the status.
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -8,45 +9,41 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
-use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
 use tracing::error;
 
 use crate::clock::unix_now;
-use crate::tokens::{generate_token, hash_from_b64};
+use crate::db::{ADMIN_MARKER_LIFETIME_SECS, PENDING_LIFETIME_SECS, SESSION_LIFETIME_SECS};
+use crate::telegram;
+use crate::tokens::generate_token;
+use crate::tokens::hash_from_b64;
 use crate::web::AppState;
 
-/// Sliding session lifetime: 30 days of inactivity.
-const SESSION_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
-/// Invitation tokens expire after 3 days.
-const INVITE_LIFETIME_SECS: i64 = 3 * 24 * 60 * 60;
-/// Login tokens are one-shot and expire after 1 hour.
-const LOGIN_TOKEN_LIFETIME_SECS: i64 = 60 * 60;
+/// Upper bound on queued registration requests, so a public vhost cannot
+/// grow the table without bound.
+pub const PENDING_QUEUE_CAP: i64 = 100;
 
-/// Attributes shared by the set and clear cookie; only the value and
-/// Max-Age differ.
+/// Name of the cookie carrying the OIDC login state token.
+pub const OIDC_STATE_COOKIE: &str = "oidc_login";
+
+/// Name of the cookie marking a browser that completed an admin SSO login
+/// before. The login page auto-redirects such a browser straight into the
+/// provider, so regular users never see any admin surface. Logout clears
+/// it; so it stays invisible unless the admin logs in again.
+pub const WAS_ADMIN_COOKIE: &str = "was_admin";
+
+/// Attributes shared by the set and clear session cookie; only the value
+/// and Max-Age differ.
 const COOKIE_ATTRIBUTES: &str = "Path=/api; HttpOnly; SameSite=Lax; Secure";
 
 /// Build the auth routes under `/api/auth`.
 pub fn auth_routes(state: AppState) -> Router<AppState> {
     Router::new()
-        .route(
-            "/invite",
-            post(invite).route_layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                admin_middleware,
-            )),
-        )
-        .route("/register", post(register))
-        .route("/login", post(login))
-        .route(
-            "/addDevice",
-            post(add_device).route_layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                auth_middleware,
-            )),
-        )
+        .route("/config", get(config))
+        .route("/telegram", post(telegram_login))
+        .route("/oidc/login", get(super::oidc::login))
+        .route("/oidc/callback", get(super::oidc::callback))
         .route(
             "/me",
             get(me).route_layer(axum::middleware::from_fn_with_state(
@@ -67,9 +64,9 @@ pub fn auth_routes(state: AppState) -> Router<AppState> {
 /// The authenticated user, inserted into request extensions by the auth
 /// middleware.
 #[derive(Debug, Clone)]
-struct AuthedUser {
-    id: i64,
-    name: Option<String>,
+pub struct AuthedUser {
+    pub id: i64,
+    pub name: Option<String>,
 }
 
 /// Hash of the session token as it arrived on the request, before rotation.
@@ -89,15 +86,6 @@ struct SessionRow {
     user_id: i64,
     name: Option<String>,
     expires: i64,
-}
-
-struct TokenRow {
-    user_id: i64,
-    expires: Option<i64>,
-}
-
-struct UserIdRow {
-    id: i64,
 }
 
 /// Require a valid session cookie, rotating it on the way through.
@@ -212,227 +200,230 @@ async fn authenticate(db: &SqlitePool, headers: &HeaderMap) -> Result<Authentica
     })
 }
 
-/// `POST /api/auth/invite`: create a user row and a 3-day invitation token
-/// for it. Admin only.
-async fn invite(State(state): State<AppState>) -> Result<Response, Response> {
-    let (token, hash) = generate_token();
-    let expires = unix_now().saturating_add(INVITE_LIFETIME_SECS);
-
-    let mut tx = state.db.begin().await.map_err(|source| db_error(&source))?;
-    let user = sqlx::query!(r#"INSERT INTO users (name) VALUES (NULL) RETURNING id"#)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|source| db_error(&source))?;
-    sqlx::query!(
-        r#"INSERT INTO tokens (token_hash, kind, user_id, expires)
-           VALUES (?, 'invitation', ?, ?)"#,
-        &hash[..],
-        user.id,
-        expires
+/// `GET /api/auth/config`: which login methods this runner offers. The
+/// login page renders itself from this. `was_admin` says whether this
+/// browser completed an admin SSO login before; only the login flow reads
+/// it, and it exists precisely so the admin never sees a login page.
+async fn config(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let was_admin = cookie_value(&headers, WAS_ADMIN_COOKIE).is_some();
+    json_response(
+        StatusCode::OK,
+        json!({
+            "bot_username": state.bot_username(),
+            "oidc": state.oidc.is_some(),
+            "was_admin": was_admin,
+        }),
     )
-    .execute(&mut *tx)
-    .await
-    .map_err(|source| db_error(&source))?;
-    tx.commit().await.map_err(|source| db_error(&source))?;
-
-    Ok(json_response(
-        StatusCode::CREATED,
-        json!({ "invitation_token": token }),
-    ))
 }
 
-#[derive(Debug, Deserialize)]
-struct RegisterBody {
-    invitation_token: String,
-    name: String,
-}
-
-/// `POST /api/auth/register`: claim an invitation token by picking a name.
-/// A name that already exists claims that user; a free name claims the
-/// token's own user row (the invited placeholder, or the admin's user 0 for
-/// the bootstrap token).
-async fn register(
+/// `POST /api/auth/telegram`: trade a signed telegram login widget payload
+/// for a session. Known accounts log in directly; unknown accounts land in
+/// the approval queue; banned accounts are refused.
+async fn telegram_login(
     State(state): State<AppState>,
-    Json(body): Json<RegisterBody>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, Response> {
-    let Ok(hash) = hash_from_b64(&body.invitation_token) else {
-        return Ok(json_error(StatusCode::BAD_REQUEST, "malformed token"));
-    };
-
-    let now = unix_now();
-    let mut tx = state.db.begin().await.map_err(|source| db_error(&source))?;
-
-    let token = sqlx::query_as!(
-        TokenRow,
-        "SELECT user_id, expires FROM tokens
-         WHERE token_hash = ? AND kind = 'invitation'",
-        &hash[..]
-    )
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|source| db_error(&source))?;
-    let Some(token) = token else {
+    struct AccountRow {
+        id: i64,
+        banned: bool,
+    }
+    if !state.telegram.login_configured() {
         return Ok(json_error(
             StatusCode::NOT_FOUND,
-            "unknown invitation token",
+            "telegram login is not configured",
+        ));
+    }
+    let Some(payload) = body.as_object() else {
+        return Ok(json_error(
+            StatusCode::BAD_REQUEST,
+            "the login payload must be a JSON object",
         ));
     };
-    if token.expires.is_some_and(|expires| expires <= now) {
+    let identity = telegram::verify_login_payload(payload, &state.telegram.token, unix_now())
+        .map_err(|err| {
+            let (status, message) = match err {
+                telegram::LoginVerifyError::Stale => {
+                    (StatusCode::BAD_REQUEST, "login payload expired, try again")
+                }
+                telegram::LoginVerifyError::Malformed
+                | telegram::LoginVerifyError::BadSignature => {
+                    (StatusCode::UNAUTHORIZED, "invalid login payload")
+                }
+            };
+            json_error(status, message)
+        })?;
+
+    let account = sqlx::query_as!(
+        AccountRow,
+        r#"SELECT id, banned AS "banned: bool" FROM users WHERE telegram_id = ?"#,
+        identity.telegram_id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|source| db_error(&source))?;
+
+    if let Some(account) = account {
+        if account.banned {
+            return Ok(json_error(StatusCode::FORBIDDEN, "this account is banned"));
+        }
+        return mint_session_response(&state.db, account.id).await;
+    }
+
+    // Unknown account: queue a registration request for the admin to
+    // approve.
+    queue_registration(&state, &identity).await
+}
+
+/// Queue an unknown account for admin approval and ping the admin chat
+/// once. A second request while already queued is a conflict, not a new
+/// queue entry, and never a second notification.
+async fn queue_registration(
+    state: &AppState,
+    identity: &telegram::LoginIdentity,
+) -> Result<Response, Response> {
+    struct PendingCount {
+        count: i64,
+    }
+    let PendingCount { count } = sqlx::query_as!(
+        PendingCount,
+        r#"SELECT COUNT(*) AS "count: i64" FROM pending_users"#,
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|source| db_error(&source))?;
+    if count >= PENDING_QUEUE_CAP {
         return Ok(json_error(
-            StatusCode::UNAUTHORIZED,
-            "invitation token expired",
+            StatusCode::TOO_MANY_REQUESTS,
+            "the registration queue is full, try again later",
         ));
     }
 
-    let claimed = sqlx::query_as!(UserIdRow, "SELECT id FROM users WHERE name = ?", body.name)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|source| db_error(&source))?;
-
-    let user_id = if let Some(existing) = claimed {
-        // Claim the existing user. The invited placeholder row becomes an
-        // orphan; drop it in the same transaction, but never the admin,
-        // a named user, or the claimed user itself. The token row goes
-        // first so the foreign key does not hold the deletion back.
-        sqlx::query!("DELETE FROM tokens WHERE token_hash = ?", &hash[..])
-            .execute(&mut *tx)
-            .await
-            .map_err(|source| db_error(&source))?;
-        sqlx::query!(
-            "DELETE FROM users WHERE id = ? AND id != 0 AND id != ? AND name IS NULL",
-            token.user_id,
-            existing.id
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| db_error(&source))?;
-        existing.id
-    } else {
-        let updated = sqlx::query!(
-            "UPDATE users SET name = ? WHERE id = ?",
-            body.name,
-            token.user_id
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| {
-            if source
-                .as_database_error()
-                .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
-            {
-                json_error(StatusCode::BAD_REQUEST, "user already exists")
-            } else {
-                db_error(&source)
-            }
-        })?;
-        if updated.rows_affected() == 0 {
+    let created = unix_now();
+    let cutoff = created.saturating_sub(PENDING_LIFETIME_SECS);
+    struct ExistingRow {
+        created: i64,
+    }
+    let existing = sqlx::query_as!(
+        ExistingRow,
+        "SELECT created FROM pending_users WHERE telegram_id = ?",
+        identity.telegram_id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|source| db_error(&source))?;
+    match existing {
+        // A live request: a second one is a conflict, never a refresh.
+        Some(row) if row.created > cutoff => {
             return Ok(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "token user is gone",
+                StatusCode::CONFLICT,
+                "a registration request for this account is already \
+                 waiting for approval",
             ));
         }
-        sqlx::query!("DELETE FROM tokens WHERE token_hash = ?", &hash[..])
-            .execute(&mut *tx)
-            .await
-            .map_err(|source| db_error(&source))?;
-        token.user_id
-    };
+        // An expired request the hourly sweep has not reached yet: it is
+        // invisible to the admin and unapprovable, so replace it.
+        Some(_) => {
+            let refreshed = sqlx::query!(
+                "UPDATE pending_users SET name = ?, username = ?, created = ?
+                 WHERE telegram_id = ?",
+                identity.name,
+                identity.username,
+                created,
+                identity.telegram_id
+            )
+            .execute(&state.db)
+            .await;
+            if let Err(source) = refreshed {
+                return Err(db_error(&source));
+            }
+        }
+        None => {
+            let inserted = sqlx::query!(
+                "INSERT INTO pending_users (telegram_id, name, username, created)
+                 VALUES (?, ?, ?, ?)",
+                identity.telegram_id,
+                identity.name,
+                identity.username,
+                created
+            )
+            .execute(&state.db)
+            .await;
+            if let Err(source) = inserted {
+                if source
+                    .as_database_error()
+                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
+                {
+                    // Lost a race with a concurrent request; treat it as
+                    // the conflict it is.
+                    return Ok(json_error(
+                        StatusCode::CONFLICT,
+                        "a registration request for this account is already \
+                         waiting for approval",
+                    ));
+                }
+                return Err(db_error(&source));
+            }
+        }
+    }
 
-    let (session_token, session_hash) = generate_token();
-    let expires = now.saturating_add(SESSION_LIFETIME_SECS);
+    // Tell the admin chat. Fire and forget: a Telegram outage must not
+    // break the queueing itself, and approval also works from the panel.
+    let who = identity
+        .username
+        .clone()
+        .or_else(|| identity.name.clone())
+        .unwrap_or_else(|| identity.telegram_id.to_string());
+    let id = identity.telegram_id;
+    telegram::send_message(
+        &state.telegram,
+        &format!("registration request from {who} (id {id}) - approve it in the admin panel"),
+    );
+
+    Ok(json_response(
+        StatusCode::ACCEPTED,
+        json!({ "status": "pending" }),
+    ))
+}
+
+/// Mint a fresh session row for `user_id` and return the `Set-Cookie`
+/// header value, ready to append to any response.
+pub async fn mint_session_cookie(db: &SqlitePool, user_id: i64) -> Result<HeaderValue, Response> {
+    let (token, hash) = generate_token();
+    let expires = unix_now().saturating_add(SESSION_LIFETIME_SECS);
     sqlx::query!(
         "INSERT INTO sessions (token_hash, user_id, expires) VALUES (?, ?, ?)",
-        &session_hash[..],
+        &hash[..],
         user_id,
         expires
     )
-    .execute(&mut *tx)
+    .execute(db)
     .await
     .map_err(|source| db_error(&source))?;
-    tx.commit().await.map_err(|source| db_error(&source))?;
-
-    Ok(set_cookie_response(&session_token))
+    cookie_header(&token, SESSION_LIFETIME_SECS).ok_or_else(internal_error)
 }
 
-#[derive(Debug, Deserialize)]
-struct LoginBody {
-    login_token: String,
-}
-
-/// `POST /api/auth/login`: trade a one-shot login token for a session.
-async fn login(
-    State(state): State<AppState>,
-    Json(body): Json<LoginBody>,
-) -> Result<Response, Response> {
-    let Ok(hash) = hash_from_b64(&body.login_token) else {
-        return Ok(json_error(StatusCode::BAD_REQUEST, "malformed token"));
-    };
-
-    let now = unix_now();
-    let mut tx = state.db.begin().await.map_err(|source| db_error(&source))?;
-    let token = sqlx::query_as!(
-        TokenRow,
-        "SELECT user_id, expires FROM tokens WHERE token_hash = ? AND kind = 'login'",
-        &hash[..]
-    )
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|source| db_error(&source))?;
-    let Some(token) = token else {
-        return Ok(json_error(StatusCode::NOT_FOUND, "unknown login token"));
-    };
-    if token.expires.is_some_and(|expires| expires <= now) {
-        return Ok(json_error(StatusCode::UNAUTHORIZED, "login token expired"));
-    }
-
-    sqlx::query!("DELETE FROM tokens WHERE token_hash = ?", &hash[..])
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| db_error(&source))?;
-    let (session_token, session_hash) = generate_token();
-    let expires = now.saturating_add(SESSION_LIFETIME_SECS);
-    sqlx::query!(
-        "INSERT INTO sessions (token_hash, user_id, expires) VALUES (?, ?, ?)",
-        &session_hash[..],
-        token.user_id,
-        expires
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(|source| db_error(&source))?;
-    tx.commit().await.map_err(|source| db_error(&source))?;
-
-    Ok(set_cookie_response(&session_token))
-}
-
-/// `POST /api/auth/addDevice`: mint a 1-hour login token for the caller.
-async fn add_device(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthedUser>,
-) -> Result<Response, Response> {
-    let (token, hash) = generate_token();
-    let expires = unix_now().saturating_add(LOGIN_TOKEN_LIFETIME_SECS);
-    sqlx::query!(
-        r#"INSERT INTO tokens (token_hash, kind, user_id, expires)
-           VALUES (?, 'login', ?, ?)"#,
-        &hash[..],
-        user.id,
-        expires
-    )
-    .execute(&state.db)
-    .await
-    .map_err(|source| db_error(&source))?;
-    Ok(json_response(
-        StatusCode::CREATED,
-        json!({ "login_token": token }),
-    ))
+/// Mint a session and answer like the old registration endpoint: 201 with
+/// the session cookie set.
+async fn mint_session_response(db: &SqlitePool, user_id: i64) -> Result<Response, Response> {
+    let cookie = mint_session_cookie(db, user_id).await?;
+    let mut response = StatusCode::CREATED.into_response();
+    response.headers_mut().append(header::SET_COOKIE, cookie);
+    Ok(response)
 }
 
 /// `GET /api/auth/me`: who am I. A NULL name renders as the literal string
-/// `"<null>"`, mc-runner parity wart.
+/// `"<null>"`, mc-runner parity wart. `is_admin` gates the admin surface of
+/// the frontend; the check is the structural one.
 async fn me(Extension(user): Extension<AuthedUser>) -> Response {
     let name = user.name.unwrap_or_else(|| String::from("<null>"));
-    json_response(StatusCode::OK, json!({ "id": user.id, "name": name }))
+    json_response(
+        StatusCode::OK,
+        json!({
+            "id": user.id,
+            "name": name,
+            "is_admin": user.id == 0,
+        }),
+    )
 }
 
 /// `DELETE /api/auth/logout`: delete the current session row and clear the
@@ -454,6 +445,11 @@ async fn logout(
 
     let mut response = (StatusCode::OK, Json(json!({}))).into_response();
     if let Some(cookie) = clear_cookie_header() {
+        response.headers_mut().append(header::SET_COOKIE, cookie);
+    }
+    // Leaving admin mode means the browser stops auto-redirecting into the
+    // SSO flow; the next login happens through the same page everyone sees.
+    if let Some(cookie) = clear_was_admin_cookie() {
         response.headers_mut().append(header::SET_COOKIE, cookie);
     }
     Ok(response)
@@ -479,28 +475,36 @@ fn cookie_header(token: &str, max_age_secs: i64) -> Option<HeaderValue> {
     .ok()
 }
 
-fn clear_cookie_header() -> Option<HeaderValue> {
-    HeaderValue::from_str(&format!("auth=; {COOKIE_ATTRIBUTES}; Max-Age=0")).ok()
+/// Set-Cookie value marking the browser as one that has seen a completed
+/// admin SSO login.
+pub fn was_admin_cookie() -> Option<HeaderValue> {
+    HeaderValue::from_str(&format!(
+        "{WAS_ADMIN_COOKIE}=1; {COOKIE_ATTRIBUTES}; \
+         Max-Age={ADMIN_MARKER_LIFETIME_SECS}"
+    ))
+    .ok()
 }
 
-fn set_cookie_response(token: &str) -> Response {
-    let Some(cookie) = cookie_header(token, SESSION_LIFETIME_SECS) else {
-        return internal_error();
-    };
-    let mut response = StatusCode::CREATED.into_response();
-    response.headers_mut().append(header::SET_COOKIE, cookie);
-    response
+pub fn clear_was_admin_cookie() -> Option<HeaderValue> {
+    HeaderValue::from_str(&format!(
+        "{WAS_ADMIN_COOKIE}=; {COOKIE_ATTRIBUTES}; Max-Age=0"
+    ))
+    .ok()
+}
+
+fn clear_cookie_header() -> Option<HeaderValue> {
+    HeaderValue::from_str(&format!("auth=; {COOKIE_ATTRIBUTES}; Max-Age=0")).ok()
 }
 
 fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
     (status, Json(body)).into_response()
 }
 
-fn json_error(status: StatusCode, message: &str) -> Response {
+pub fn json_error(status: StatusCode, message: &str) -> Response {
     json_response(status, json!({ "error": message }))
 }
 
-fn db_error(source: &sqlx::Error) -> Response {
+pub fn db_error(source: &sqlx::Error) -> Response {
     error!("database error while handling an auth request: {source}");
     json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
@@ -561,7 +565,15 @@ mod tests {
     #[test]
     fn lifetime_constants_are_as_specified() {
         assert_eq!(SESSION_LIFETIME_SECS, 30 * 24 * 60 * 60);
-        assert_eq!(INVITE_LIFETIME_SECS, 3 * 24 * 60 * 60);
-        assert_eq!(LOGIN_TOKEN_LIFETIME_SECS, 60 * 60);
+        assert_eq!(
+            crate::db::PENDING_LIFETIME_SECS,
+            60 * 60,
+            "pending requests live one hour"
+        );
+        assert_eq!(
+            crate::db::OIDC_STATE_LIFETIME_SECS,
+            10 * 60,
+            "in-flight oidc logins live ten minutes"
+        );
     }
 }

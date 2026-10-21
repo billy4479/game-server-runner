@@ -1,15 +1,24 @@
-//! Database bootstrap: pool creation, migrations, the admin bootstrap token,
-//! and the periodic cleanup of expired sessions and tokens.
+//! Database bootstrap: pool creation, migrations, and the periodic cleanup
+//! of expired sessions, registration requests and login states.
 
 use std::time::Duration;
 
 use sqlx::SqlitePool;
 use sqlx::migrate::MigrateError;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::clock::unix_now;
-use crate::tokens::generate_token;
+
+/// Sliding session lifetime: 30 days of inactivity.
+pub const SESSION_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
+/// Unapproved registration requests are dropped after one hour.
+pub const PENDING_LIFETIME_SECS: i64 = 60 * 60;
+/// In-flight OIDC logins expire after 10 minutes.
+pub const OIDC_STATE_LIFETIME_SECS: i64 = 10 * 60;
+/// A browser that completed an admin SSO login once keeps the
+/// auto-redirect marker for a year.
+pub const ADMIN_MARKER_LIFETIME_SECS: i64 = 365 * 24 * 60 * 60;
 
 /// Errors that can occur while opening the database.
 #[derive(Debug, thiserror::Error)]
@@ -43,44 +52,18 @@ pub async fn init(db_path: &str) -> Result<SqlitePool, DbError> {
     Ok(pool)
 }
 
-/// Make sure user 0 has a usable invitation token, generating a
-/// never-expiring one and logging it otherwise. mc-runner parity.
-///
-/// # Errors
-/// Returns [`DbError`] if the queries fail.
-pub async fn ensure_admin_token(pool: &SqlitePool) -> Result<(), DbError> {
-    let now = unix_now();
-    let row = sqlx::query!(
-        r#"SELECT COUNT(*) AS "count: i64" FROM tokens
-           WHERE user_id = 0 AND kind = 'invitation'
-             AND (expires IS NULL OR expires > ?)"#,
-        now
-    )
-    .fetch_one(pool)
-    .await?;
-    if row.count > 0 {
-        return Ok(());
-    }
-
-    let (token, hash) = generate_token();
-    sqlx::query!(
-        r#"INSERT INTO tokens (token_hash, kind, user_id, expires)
-           VALUES (?, 'invitation', 0, NULL)"#,
-        &hash[..]
-    )
-    .execute(pool)
-    .await?;
-    info!("admin invitation token: {token}");
-    Ok(())
-}
-
 /// Spawn the housekeeping task: clean expired rows now, then every hour.
 pub fn spawn_cleanup_task(pool: SqlitePool) {
     tokio::spawn(async move {
         loop {
             match cleanup_once(&pool).await {
-                Ok((sessions, tokens)) => {
-                    debug!(sessions, tokens, "cleaned expired sessions and tokens");
+                Ok(counts) => {
+                    debug!(
+                        sessions = counts.sessions,
+                        pending_users = counts.pending_users,
+                        oidc_logins = counts.oidc_logins,
+                        "cleaned expired rows"
+                    );
                 }
                 Err(source) => warn!("could not clean expired rows: {source}"),
             }
@@ -89,18 +72,35 @@ pub fn spawn_cleanup_task(pool: SqlitePool) {
     });
 }
 
-async fn cleanup_once(pool: &SqlitePool) -> Result<(u64, u64), sqlx::Error> {
+struct CleanupCounts {
+    sessions: u64,
+    pending_users: u64,
+    oidc_logins: u64,
+}
+
+async fn cleanup_once(pool: &SqlitePool) -> Result<CleanupCounts, sqlx::Error> {
     let now = unix_now();
     let sessions = sqlx::query!("DELETE FROM sessions WHERE expires <= ?", now)
         .execute(pool)
         .await?
         .rows_affected();
-    let tokens = sqlx::query!(
-        "DELETE FROM tokens WHERE expires IS NOT NULL AND expires <= ?",
-        now
+    let pending_users = sqlx::query!(
+        "DELETE FROM pending_users WHERE created <= ?",
+        now.saturating_sub(PENDING_LIFETIME_SECS)
     )
     .execute(pool)
     .await?
     .rows_affected();
-    Ok((sessions, tokens))
+    let oidc_logins = sqlx::query!(
+        "DELETE FROM oidc_logins WHERE expires <= ?",
+        now.saturating_sub(OIDC_STATE_LIFETIME_SECS)
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(CleanupCounts {
+        sessions,
+        pending_users,
+        oidc_logins,
+    })
 }
