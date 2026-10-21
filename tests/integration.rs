@@ -100,7 +100,10 @@ done
 
 /// Fake `restic`: appends its argv to `restic-args.log` in the working
 /// directory (the runner's temp dir) and exits 0.
-const FAKE_RESTIC_SCRIPT: &str = r#"#!/usr/bin/env bash
+///
+/// Spawned by absolute path, so the shebang matters: `#!/bin/sh` also
+/// works in a nix build sandbox, where `/usr/bin/env` does not exist.
+const FAKE_RESTIC_SCRIPT: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> restic-args.log
 exit 0
 "#;
