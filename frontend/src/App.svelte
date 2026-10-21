@@ -2,14 +2,19 @@
   import { getLocalMe, updateMeFromAPI } from "$lib/state.svelte";
   import LoginScreen from "./LoginScreen.svelte";
   import MainPage from "./MainPage.svelte";
+  import AdminPage from "./AdminPage.svelte";
 
   $effect(() => {
     updateMeFromAPI();
   });
+
+  const isAdminPath = location.pathname === "/admin" || location.pathname.startsWith("/admin/");
 </script>
 
 <main class="flex h-screen items-center justify-center gap-4">
-  {#if getLocalMe() === null}
+  {#if isAdminPath}
+    <AdminPage />
+  {:else if getLocalMe() === null}
     Loading...
   {:else if getLocalMe()?.isError}
     {#if getLocalMe()?.status === 401}

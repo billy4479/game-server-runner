@@ -1,9 +1,9 @@
 <script lang="ts">
   import { getLocalMe, updateMeFromAPI } from "$lib/state.svelte";
-  import { addDevice, invite, logout } from "$lib/api";
+  import { logout } from "$lib/api";
   import { ServerSocket } from "$lib/ws.svelte";
 
-  import { Button, Modal } from "flowbite-svelte";
+  import { Button } from "flowbite-svelte";
 
   let consoleOutput: HTMLDivElement;
 
@@ -22,7 +22,6 @@
     };
   });
 
-  let addDeviceModal = $state(false);
   let timeBeforeStop = $state(0);
 
   function formatDuration(seconds: number) {
@@ -44,27 +43,8 @@
   });
 </script>
 
-<Modal title="Add device" bind:open={addDeviceModal}>
-  By clicking the button below you will copy a token. Paste that token in the
-  login field of the new device. Each token is valid for only one device and
-  expires in 1 hour.
-
-  <span> </span>
-
-  <div class="mt-5 flex justify-center">
-    <Button
-      color="green"
-      onclick={() => {
-        addDeviceModal = false;
-        addDevice();
-      }}
-    >
-      Undestood, copy the token
-    </Button>
-  </div>
-</Modal>
-
-<div class="w-4/5 rounded border border-gray-300">
+<div class="flex w-4/5 flex-col gap-4">
+  <div class="rounded border border-gray-300">
   <div
     class="flex flex-row items-center justify-between border-b border-gray-300 px-5 py-3"
   >
@@ -88,19 +68,11 @@
     </div>
 
     <div>
-      {#if getLocalMe()?.user?.id === 0}
-        <Button size="xs" outline color="light" onclick={invite}>Invite</Button>
+      {#if getLocalMe()?.user?.is_admin}
+        <Button href="/admin" size="xs" outline color="light" class="mr-2">
+          Admin dashboard
+        </Button>
       {/if}
-      <Button
-        size="xs"
-        outline
-        color="light"
-        onclick={() => {
-          addDeviceModal = true;
-        }}
-      >
-        Add device
-      </Button>
       <Button
         size="xs"
         outline
@@ -188,5 +160,6 @@
         {/if}
       </div>
     </div>
+  </div>
   </div>
 </div>
