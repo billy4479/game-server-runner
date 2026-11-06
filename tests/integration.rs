@@ -42,6 +42,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(15);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+const STARTUP_TIMEOUT_ENV: &str = "GAME_SERVER_RUNNER_TEST_STARTUP_TIMEOUT_SECS";
 /// Sessions slide forward by this many seconds on every authenticated
 /// request; the rotation test needs the clock to move at least one second.
 const ROTATION_SLEEP: Duration = Duration::from_millis(1100);
@@ -726,23 +727,94 @@ async fn http_get(port: u16, path: &str) -> Result<(u16, String), String> {
     Ok((status, body))
 }
 
-async fn wait_until_listening(port: u16) -> Result<(), String> {
-    let deadline = Instant::now()
-        .checked_add(Duration::from_secs(15))
-        .unwrap_or_else(Instant::now);
-    loop {
-        if let Ok((200, body)) = http_get(port, "/api/ping").await
-            && body == "pong"
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "runner did not start listening on port {port} in time"
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+fn parse_startup_timeout(value: &str) -> Result<Duration, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|err| format!("invalid {STARTUP_TIMEOUT_ENV}: {err}"))?;
+    if seconds == 0 {
+        return Err(format!("{STARTUP_TIMEOUT_ENV} must be greater than zero"));
     }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn startup_timeout() -> Result<Duration, String> {
+    match std::env::var(STARTUP_TIMEOUT_ENV) {
+        Ok(value) => parse_startup_timeout(&value),
+        Err(std::env::VarError::NotPresent) => Ok(STARTUP_TIMEOUT),
+        Err(err) => Err(format!("invalid {STARTUP_TIMEOUT_ENV}: {err}")),
+    }
+}
+
+async fn wait_until_listening(port: u16) -> Result<(), String> {
+    wait_until_listening_with_timeout(port, startup_timeout()?).await
+}
+
+async fn wait_until_listening_with_timeout(port: u16, timeout: Duration) -> Result<(), String> {
+    // Bound the entire probe loop, including an accepted connection whose
+    // server has not yet had enough CPU time to send an HTTP response.
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Ok((200, body)) = http_get(port, "/api/ping").await
+                && body == "pong"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_elapsed| {
+        format!("runner did not respond with pong on port {port} within {timeout:?}")
+    })
+}
+
+#[test]
+fn startup_timeout_accepts_positive_seconds() {
+    assert_eq!(parse_startup_timeout("120"), Ok(Duration::from_secs(120)));
+}
+
+#[test]
+fn startup_timeout_rejects_invalid_budgets() {
+    for value in ["0", "-1", "", "invalid", "18446744073709551616"] {
+        assert!(parse_startup_timeout(value).is_err());
+    }
+}
+
+#[tokio::test]
+async fn readiness_retries_until_ping_succeeds() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind ready server");
+    let port = listener.local_addr().expect("listener address").port();
+    let server = tokio::spawn(async move {
+        let responses: [&[u8]; 2] = [
+            b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong",
+        ];
+        for response in responses {
+            let (mut stream, _) = listener.accept().await.expect("accept readiness probe");
+            let mut request = [0; 1024];
+            stream.read(&mut request).await.expect("read probe");
+            stream
+                .write_all(response)
+                .await
+                .expect("send ping response");
+        }
+    });
+    assert!(wait_until_listening(port).await.is_ok());
+    server.await.expect("ready server task");
+}
+
+#[tokio::test]
+async fn readiness_timeout_also_bounds_a_stalled_http_response() {
+    // Keep the listener open without serving HTTP. TCP can connect, but the
+    // readiness check must still time out instead of hanging in read_to_end.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind stalled server");
+    let port = listener.local_addr().expect("listener address").port();
+    let result = wait_until_listening_with_timeout(port, Duration::from_millis(10)).await;
+    assert!(result.is_err());
 }
 
 // --- auth helpers -----------------------------------------------------------
@@ -1192,7 +1264,7 @@ async fn wait_for_state(
     predicate: impl Fn(&Value) -> bool,
 ) -> Result<Value, String> {
     let deadline = Instant::now()
-        .checked_add(STARTUP_TIMEOUT)
+        .checked_add(startup_timeout()?)
         .unwrap_or_else(Instant::now);
     loop {
         if Instant::now() >= deadline {
@@ -1218,7 +1290,7 @@ async fn start_server_via_ws(ws: &mut WsClient) -> Result<(), String> {
     let mut saw_banner = false;
     let mut saw_running = false;
     let deadline = Instant::now()
-        .checked_add(STARTUP_TIMEOUT)
+        .checked_add(startup_timeout()?)
         .unwrap_or_else(Instant::now);
     ws_send(ws, "start").await?;
     let running = json!(true);

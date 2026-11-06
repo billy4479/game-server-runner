@@ -208,3 +208,8 @@ Rust work:
 - `cargo test` runs everything, including integration tests that spawn fake
   game server scripts and drive start, join, leave, auto-stop and stop
   through the real binary.
+  Readiness checks wait for a successful `/api/ping` response, not a fixed
+  startup delay. Set `GAME_SERVER_RUNNER_TEST_STARTUP_TIMEOUT_SECS` to a
+  positive number of seconds when testing on a busy machine. Nix builds use
+  120 seconds and run tests serially to avoid competing test servers. This
+  only changes the startup/readiness budget, not lifecycle timing assertions.
