@@ -2,6 +2,7 @@
   lib,
   rustPlatform,
   frontend,
+  sqlite,
 }:
 
 rustPlatform.buildRustPackage {
@@ -19,6 +20,8 @@ rustPlatform.buildRustPackage {
       ./.sqlx
     ];
   };
+
+  buildInputs = [ sqlite ];
 
   cargoLock.lockFile = ./Cargo.lock;
   buildFeatures = [ "embed-frontend" ];
